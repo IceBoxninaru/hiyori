@@ -1,0 +1,8 @@
+# Audit reports, pose files and local exports stay local (they describe licensed assets).
+reports/
+local/
+out/
+source/
+*.report.json
+report*.json
+poses*.json
