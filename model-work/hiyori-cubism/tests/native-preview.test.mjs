@@ -12,6 +12,7 @@ import {fileURLToPath} from 'node:url';
 import {preparePreview, createPreviewServer, resolveRequest, parseArgs, parseCamera, PREVIEW_FILES} from '../tools/serve-native-preview.mjs';
 import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView} from '../preview/pose-core.mjs';
 import {createLoadGuard} from '../preview/load-guard.mjs';
+import {renderSlotOnce, disposeRecord, loadSlotsOwned, purgeTextureCache, generationUrl, FIXED_UPDATE_MS} from '../preview/render-step.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WIN = process.platform === 'win32';
@@ -170,7 +171,7 @@ test('server serves exactly the page, preview files, three vendors, sanitized co
   try {
     const prepared = await preparePreview(fx.opts);
     const urls = [...prepared.routes.keys()].sort();
-    assert.deepEqual(urls, ['/', '/app/app.mjs', '/app/load-guard.mjs', '/app/pose-core.mjs', '/app/style.css', '/config.json',
+    assert.deepEqual(urls, ['/', '/app/app.mjs', '/app/load-guard.mjs', '/app/pose-core.mjs', '/app/render-step.mjs', '/app/style.css', '/config.json',
       '/m/after/r/0.moc3', '/m/after/r/1.png', '/m/before/r/0.moc3', '/m/before/r/1.png', '/vendor/core.js', '/vendor/live2d-display.js', '/vendor/pixi.js']);
     const configText = JSON.stringify(prepared.config);
     assert.ok(!configText.includes(fx.dir) && !configText.includes(tmpdir()), 'no absolute paths in config');
@@ -299,5 +300,114 @@ test('optional pixi-unsafe-eval helper is served as an exact fourth vendor only 
     });
     await assert.rejects(preparePreview({...fx.opts, pixiUnsafeEval: path.join(fx.dir, 'none.js')}), e => e.code === 'E_VENDOR_MISSING' && !e.message.includes(fx.dir));
     assert.equal(parseArgs(['--before=a', '--after=b', '--poses=p', '--core=c', '--pixi=x', '--live2d-display=l', '--port=5190', '--pixi-unsafe-eval=u']).pixiUnsafeEval, 'u');
+  } finally { await fx.cleanup(); }
+});
+
+// ---- review of d6ccb5f: delta gate, shared renderer, ownership -----------------------------
+// Fake of pixi-live2d-display 0.4.0's gate: _render runs internalModel.update only when
+// deltaTime (grown only by update(dt)) is non-zero, then resets it. Synthetic, not real Pixi.
+function gatedModel(internal) {
+  return {internalModel: internal, deltaTime: 0, elapsedTime: 0, visible: true, textures: [],
+    update(dt) { this.deltaTime += dt; this.elapsedTime += dt; },
+    _render() { if (this.deltaTime) { this.internalModel.update(this.deltaTime, this.elapsedTime); this.deltaTime = 0; } }};
+}
+const fakeRenderer = () => {
+  const log = [];
+  return {log, view: {id: 'shared-webgl-canvas'}, render(stage) { for (const child of stage.children) if (child.visible) { log.push(child.name); child._render(); } }};
+};
+
+test('delta gate: a render WITHOUT update(dt) never applies the pose; renderSlotOnce always does', () => {
+  const f = fakeCore(SPEC());
+  const state = readDeclaredState(f.core, MOC), raw = f.newModel();
+  let applied = {}, pose = {name: 'shoulder-plus1', parameters: {ParamShoulder: 1}};
+  const internal = {coreModel: {update() { raw.update(); }}};
+  installDeterministicUpdate(internal, raw, state, () => pose, a => { applied = a; });
+  const model = Object.assign(gatedModel(internal), {name: 'before'});
+  const stage = {children: [model]}, renderer = fakeRenderer();
+  renderer.render(stage);
+  assert.deepEqual(applied, {}, 'reproduces the reported bug: gate closed, nothing applied');
+  const copies = [];
+  renderSlotOnce({renderer, stage, records: {before: {model}}, slot: 'before', copy: v => copies.push(v.id)});
+  assert.deepEqual(applied, {ParamShoulder: 1}); assert.equal(raw.parameters.values[1], 1);
+  assert.deepEqual(copies, ['shared-webgl-canvas']);
+  assert.ok(FIXED_UPDATE_MS > 0 && Number.isFinite(FIXED_UPDATE_MS));
+  pose = {name: 'default', parameters: {}};
+  renderSlotOnce({renderer, stage, records: {before: {model}}, slot: 'before', copy: () => {}});
+  assert.deepEqual(applied, {}); assert.equal(raw.parameters.values[1], 0, 'every render re-applies from defaults');
+});
+
+test('shared renderer: each slot renders alone and is copied before the next slot draws', () => {
+  const f = fakeCore(SPEC());
+  const state = readDeclaredState(f.core, MOC);
+  const records = {}, children = [], applied = {};
+  for (const slot of ['before', 'after']) {
+    const raw = f.newModel(), internal = {coreModel: {update() { raw.update(); }}};
+    installDeterministicUpdate(internal, raw, state, () => ({name: 'p', parameters: {ParamShoulder: 1}}), a => { applied[slot] = a; });
+    const model = Object.assign(gatedModel(internal), {name: slot});
+    records[slot] = {model}; children.push(model);
+  }
+  const renderer = fakeRenderer(), stage = {children}, sequence = [];
+  for (const slot of ['before', 'after']) renderSlotOnce({renderer, stage, records, slot, copy: () => sequence.push(`copy:${slot}:${renderer.log.at(-1)}`)});
+  assert.deepEqual(renderer.log, ['before', 'after'], 'only the requested slot is visible per render');
+  assert.deepEqual(sequence, ['copy:before:before', 'copy:after:after']);
+  assert.deepEqual(applied, {before: {ParamShoulder: 1}, after: {ParamShoulder: 1}});
+  assert.throws(() => renderSlotOnce({renderer, stage, records: {}, slot: 'before', copy: () => {}}), e => e.code === 'E_RENDER_STATE');
+});
+
+test('disposeRecord destroys the model and its textures, purges its URLs, and is idempotent', () => {
+  const destroyed = [];
+  const texture = name => ({destroy: base => destroyed.push(`${name}:${base}`)});
+  const parent = {removed: 0, removeChild() { this.removed++; }};
+  const model = {parent, textures: [texture('t0'), texture('t1')], destroy: opts => destroyed.push(`model:${opts.texture && opts.baseTexture}`)};
+  const purged = [];
+  const record = {model, urls: ['/m/before/r/0.moc3?g=2', '/m/before/r/1.png?g=2']};
+  disposeRecord(record, urls => purged.push(...urls));
+  disposeRecord(record, urls => purged.push(...urls));
+  assert.equal(parent.removed, 1);
+  assert.deepEqual(destroyed, ['model:true', 't0:true', 't1:true']);
+  assert.deepEqual(purged, record.urls);
+  const cache = {'/m/before/r/1.png?g=2': texture('cached'), 'http://127.0.0.1:5190/m/before/r/1.png?g=2': texture('abs'), '/m/after/r/1.png?g=2': texture('keep')};
+  assert.equal(purgeTextureCache([cache, null], ['/m/before/r/1.png?g=2'], 'http://127.0.0.1:5190/'), 2);
+  assert.deepEqual(Object.keys(cache), ['/m/after/r/1.png?g=2'], 'other slot texture untouched');
+  assert.equal(generationUrl('/m/before/r/1.png', 3), '/m/before/r/1.png?g=3');
+});
+
+test('owned two-slot loads: success, rejected second slot, stale mid-load and reload invalidation', async () => {
+  const entries = [{slot: 'before'}, {slot: 'after'}];
+  const disposed = [];
+  const dispose = r => disposed.push(r.id);
+  // success
+  let guard = createLoadGuard(), token = guard.begin();
+  const ok = await loadSlotsOwned(entries, {guard, token, dispose, loadOne: async e => ({id: `${e.slot}-${token}`})});
+  assert.deepEqual(Object.keys(ok), ['before', 'after']); assert.deepEqual(disposed, []);
+  // rejected second slot: the loaded first slot is disposed, the error propagates
+  guard = createLoadGuard(); token = guard.begin();
+  await assert.rejects(loadSlotsOwned(entries, {guard, token, dispose, loadOne: async e => { if (e.slot === 'after') throw new Error('reject'); return {id: 'before-rejected-run'}; }}), /reject/);
+  assert.deepEqual(disposed, ['before-rejected-run']);
+  // stale: a reload begins while the first slot loads; the older run disposes what it holds
+  disposed.length = 0;
+  guard = createLoadGuard();
+  const t1 = guard.begin();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const older = loadSlotsOwned(entries, {guard, token: t1, dispose, loadOne: async e => { await gate; return {id: `${e.slot}-old`}; }});
+  const t2 = guard.begin();
+  const newer = await loadSlotsOwned(entries, {guard, token: t2, dispose, loadOne: async e => ({id: `${e.slot}-new`})});
+  release();
+  assert.equal(await older, null);
+  assert.deepEqual(disposed, ['before-old'], 'old generation disposed; loading stopped before its second slot');
+  assert.deepEqual(Object.values(newer).map(r => r.id), ['before-new', 'after-new']);
+  // loadOne returning null (its own stale cleanup) aborts and disposes earlier slots
+  disposed.length = 0; guard = createLoadGuard(); token = guard.begin();
+  assert.equal(await loadSlotsOwned(entries, {guard, token, dispose, loadOne: async e => e.slot === 'after' ? null : {id: 'before-x'}}), null);
+  assert.deepEqual(disposed, ['before-x']);
+});
+
+test('per-generation URLs still resolve to the exact served routes', async () => {
+  const fx = await fixture();
+  try {
+    const prepared = await preparePreview(fx.opts);
+    assert.equal(resolveRequest(prepared.routes, generationUrl('/m/before/r/1.png', 7)).status, 200);
+    assert.equal(resolveRequest(prepared.routes, generationUrl('/m/before/r/9.png', 7)).status, 404);
   } finally { await fx.cleanup(); }
 });

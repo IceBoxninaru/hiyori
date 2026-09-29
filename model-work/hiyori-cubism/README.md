@@ -226,8 +226,26 @@ node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
 **Rendering (raw-core mode only):**
 - The Pixi model is created from a settings object containing just Moc and Textures,
   with `autoInteract:false`, `autoUpdate:false` and `motionPreload:'none'`.
-- The Pixi application is created with `autoStart:false` and `sharedTicker:false`, and
-  `interaction.useSystemTicker` is disabled. The raw Core model is read through
+- **One** Pixi application (one WebGL renderer, one stage) on an off-DOM canvas is used
+  for both models. It is created with `autoStart:false` and `sharedTicker:false`, and
+  `interaction.useSystemTicker` is disabled.
+  - Why: in a real browser, two applications left the before canvas blank. Cubism's
+    WebGL shader state is tied to one GL context.
+  - Each slot is rendered alone (the other model is hidden) and copied immediately into
+    that slot's visible 2D canvas. Crops and the PNG are drawn from those copies.
+- Before every intended render, `model.update(1000/60)` is called. pixi-live2d-display
+  0.4.0 runs `internalModel.update` from `_render` only when its accumulated `deltaTime`
+  is non-zero; without this step the pose was never applied (`appliedReadBack` stayed
+  `{}`). The diagnostics flag any requested value that was not read back from Core.
+- **Ownership:**
+  - Every load generation uses per-generation resource URLs (`?g=<n>`; the server
+    ignores the query), so a reload cannot reuse a texture cached by an earlier
+    generation.
+  - Disposing a slot removes the model, destroys it and each of its textures, and purges
+    its URLs from Pixi's texture caches.
+  - A stale load is disposed when it arrives. A rejected `Live2DModel.from` purges its
+    cached textures; its partial Cubism model is not reachable.
+  - A failure in either slot disposes the other slot's loaded model. The raw Core model is read through
   `internalModel.coreModel.getModel()`, as the current app does.
 - Its `internalModel.update` is replaced by the deterministic reset/apply/Core update
   above. So motion, idle, expressions, blinking, breath, physics, SDK Pose, gaze/focus
@@ -247,7 +265,9 @@ node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
   and old models/applications are destroyed before replacement.
 
 **Tests:** `tests/native-preview.test.mjs` is offline and synthetic. It covers pose
-validation, reset and order independence, stale-load disposal, exact serving,
+validation, reset and order independence, stale-load disposal, a fake of the 0.4.0
+`deltaTime` render gate, shared-renderer render/copy order, texture ownership and purge,
+rejected, stale and partial two-slot loads, exact serving,
 traversal/URL/junction escapes, unknown files, Host checks, path redaction, and safe
 missing-vendor/model failures. A fake Core and fake loads are **not** evidence of real
 WebGL, Pixi or texture rendering, which is verified locally.

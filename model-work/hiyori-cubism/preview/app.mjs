@@ -1,9 +1,11 @@
 // Native export pose comparison page. Raw Core mode only: every render resets all
 // parameters/part opacities to the declared defaults, applies the named pose and
 // runs Core. No motion, expression, blink, breath, physics, SDK Pose or gaze.
-// Nothing leaves the browser; "Download PNG" saves a local file.
+// One shared WebGL renderer/stage draws each model in turn; the result is copied
+// into that slot's 2D canvas. Nothing leaves the browser; "Download PNG" saves locally.
 import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, PreviewError} from './pose-core.mjs';
 import {createLoadGuard} from './load-guard.mjs';
+import {renderSlotOnce, disposeRecord, loadSlotsOwned, purgeTextureCache, generationUrl} from './render-step.mjs';
 
 const SLOTS = ['before', 'after'];
 const DEFAULT_CROP = Object.freeze({x: 0.25, y: 0.18, w: 0.3, h: 0.22});
@@ -12,7 +14,8 @@ const BG_CSS = {white: '#ffffff', dark: '#1e1f26'};
 const $ = id => document.getElementById(id);
 const guard = createLoadGuard();
 let config = null, camera = null, crop = {...DEFAULT_CROP}, currentPose = {name: 'default', parameters: {}};
-let slots = {}; // slot -> {app, model, raw, state, applied, entry}
+let slots = {}; // slot -> {model, raw, state, applied, entry, urls}
+let shared = null; // {app, view: {width, height}} - one renderer for the page lifetime
 const poseErrors = new Map();
 
 // Concise, path-free error text; details stay in the local console only.
@@ -24,7 +27,7 @@ function showError(error) { console.error(error); $('error').textContent = descr
 
 async function fetchChecked(url, kind) {
   const response = await fetch(url, {cache: 'no-store', credentials: 'omit'});
-  if (!response.ok) throw new PreviewError('E_FETCH', `${url} HTTP ${response.status}`);
+  if (!response.ok) throw new PreviewError('E_FETCH', `${url.split('?')[0]} HTTP ${response.status}`);
   return kind === 'json' ? response.json() : response.arrayBuffer();
 }
 
@@ -38,60 +41,70 @@ async function waitForVendors() {
   throw new PreviewError('E_VENDOR_UNAVAILABLE', 'Core did not initialize');
 }
 
-function freshCanvas(id) {
-  const old = $(id), fresh = old.cloneNode(false);
-  old.replaceWith(fresh); // a destroyed WebGL context cannot be reused
-  return fresh;
-}
-
-function destroySlot(record) {
-  if (!record) return;
-  try { record.app?.stage.removeChildren(); } catch { /* ignore */ }
-  try { record.model?.destroy({children: true}); } catch { /* ignore */ }
-  try { record.app?.destroy(false, {children: true, texture: true, baseTexture: true}); } catch { /* ignore */ }
-}
-
-async function loadSlot(core, slot, entry, token) {
-  const state = readDeclaredState(core, await fetchChecked(entry.moc, 'binary'));
-  if (!guard.isCurrent(token)) return null;
-  const view = freshCanvas(`view-${slot}`);
-  const app = new PIXI.Application({view, width: view.width, height: view.height, backgroundColor: BG[$('bg').value], antialias: true,
+// The single WebGL renderer, on an off-DOM canvas the size of the slot views.
+function sharedRenderer() {
+  if (shared) return shared;
+  const size = {width: $('view-before').width, height: $('view-before').height};
+  const view = Object.assign(document.createElement('canvas'), size);
+  const app = new PIXI.Application({view, ...size, backgroundColor: BG[$('bg').value], antialias: true,
     preserveDrawingBuffer: true, autoStart: false, sharedTicker: false});
   app.ticker?.stop();
   const interaction = app.renderer.plugins?.interaction;
   if (interaction) interaction.useSystemTicker = false;
-  const record = {app, model: null, raw: null, state, applied: {}, entry, view: {width: view.width, height: view.height}};
+  shared = {app, view: size};
+  return shared;
+}
+
+const purge = urls => purgeTextureCache([PIXI.utils?.TextureCache, PIXI.utils?.BaseTextureCache], urls, location.href);
+const dispose = record => disposeRecord(record, purge);
+
+// Loads one slot with explicit ownership of its model and per-generation texture URLs.
+async function loadOne(core, entry, token) {
+  const moc = generationUrl(entry.moc, token), textures = entry.textures.map(t => generationUrl(t, token));
+  const state = readDeclaredState(core, await fetchChecked(moc, 'binary'));
+  if (!guard.isCurrent(token)) return null;
+  const record = {model: null, raw: null, state, applied: {}, entry, urls: [moc, ...textures]};
   // Settings object with Moc + Textures only: no physics, pose, motion or expression files are requested.
-  const settings = {url: `/m/${slot}/model3.json`, Version: 3, FileReferences: {Moc: entry.moc, Textures: entry.textures}};
-  const model = await guard.settle(token, PIXI.live2d.Live2DModel.from(settings, {autoInteract: false, autoUpdate: false, motionPreload: 'none'}),
-    stale => { destroySlot({app, model: stale}); });
-  if (!model) return null; // stale: the settle callback already destroyed it and its app
+  const settings = {url: `/m/${entry.slot}/model3.json`, Version: 3, FileReferences: {Moc: moc, Textures: textures}};
+  let model;
+  try {
+    model = await guard.settle(token, PIXI.live2d.Live2DModel.from(settings, {autoInteract: false, autoUpdate: false, motionPreload: 'none'}),
+      stale => dispose({...record, model: stale}));
+  } catch (error) {
+    purge(record.urls); // a rejected load's partial model is unreachable; its cached textures are not
+    throw error;
+  }
+  if (!model) return null; // stale: already disposed by the settle callback
   record.model = model;
-  const internal = model.internalModel, coreModel = internal.coreModel;
+  const internal = model.internalModel, coreModel = internal?.coreModel;
   const raw = coreModel?.getModel?.() ?? coreModel?._model;
-  if (!raw?.parameters?.values || !raw?.parts?.opacities) { destroySlot(record); throw new PreviewError('E_RENDERER_API', 'raw Core model not reachable through pixi-live2d-display'); }
+  if (!raw?.parameters?.values || !raw?.parts?.opacities) { dispose(record); throw new PreviewError('E_RENDERER_API', 'raw Core model not reachable through pixi-live2d-display'); }
   record.raw = raw;
   try { internal.motionManager?.stopAllMotions?.(); } catch { /* ignore */ }
   installDeterministicUpdate(internal, raw, state, () => currentPose, applied => { record.applied = applied; });
-  app.stage.addChild(model);
+  model.visible = false;
   return record;
 }
 
 async function loadAll() {
   const token = guard.begin();
-  for (const slot of SLOTS) destroySlot(slots[slot]);
+  for (const slot of SLOTS) dispose(slots[slot]);
   slots = {}; camera = null;
   $('error').textContent = ''; $('diag').textContent = 'loading…';
   const core = await waitForVendors();
-  const loaded = {};
-  for (const entry of config.models) {
-    const record = await loadSlot(core, entry.slot, entry, token);
-    if (!record || !guard.isCurrent(token)) { destroySlot(record); for (const r of Object.values(loaded)) destroySlot(r); return; }
-    loaded[entry.slot] = record;
-    // One camera from the BEFORE canvas info (or explicit config), shared by both, never re-fitted per pose.
-    if (entry.slot === 'before') camera = deriveCamera(record.state.canvas, record.view, config.camera);
+  const {app, view} = sharedRenderer();
+  const loaded = await loadSlotsOwned(config.models, {guard, token, loadOne: (entry, t) => loadOne(core, entry, t), dispose});
+  if (!loaded) return; // superseded by a newer load; everything from this one is disposed
+  try { installLoaded(loaded, app, view); } catch (error) { for (const record of Object.values(loaded)) dispose(record); slots = {}; camera = null; throw error; }
+}
+
+function installLoaded(loaded, app, view) {
+  // One camera from the BEFORE canvas info (or explicit config), shared by both, never re-fitted per pose.
+  camera = deriveCamera(loaded.before.state.canvas, view, config.camera);
+  for (const record of Object.values(loaded)) {
     record.model.scale.set(camera.scale);
     record.model.position.set(camera.x, camera.y);
+    app.stage.addChild(record.model);
   }
   slots = loaded;
   poseErrors.clear();
@@ -113,21 +126,25 @@ async function loadAll() {
 }
 
 function drawCrop(slot) {
-  const record = slots[slot], target = $(`crop-${slot}`), g = target.getContext('2d');
+  const source = $(`view-${slot}`), target = $(`crop-${slot}`), g = target.getContext('2d');
   g.fillStyle = BG_CSS[$('bg').value]; g.fillRect(0, 0, target.width, target.height);
   const r = cropToView(camera, crop);
   const k = Math.min(target.width / r.w, target.height / r.h);
   const w = r.w * k, h = r.h * k;
   g.imageSmoothingEnabled = true;
-  g.drawImage(record.app.view, r.x, r.y, r.w, r.h, (target.width - w) / 2, (target.height - h) / 2, w, h);
+  g.drawImage(source, r.x, r.y, r.w, r.h, (target.width - w) / 2, (target.height - h) / 2, w, h);
 }
 
 function renderAll() {
-  if (!slots.before || !slots.after || !camera) return;
+  if (!slots.before || !slots.after || !camera || !shared) return;
+  const {app} = shared;
+  app.renderer.backgroundColor = BG[$('bg').value];
   for (const slot of SLOTS) {
-    const {app} = slots[slot];
-    app.renderer.backgroundColor = BG[$('bg').value];
-    app.renderer.render(app.stage); // calls the deterministic update installed above
+    const target = $(`view-${slot}`), g = target.getContext('2d');
+    renderSlotOnce({renderer: app.renderer, stage: app.stage, records: slots, slot, copy: source => {
+      g.clearRect(0, 0, target.width, target.height);
+      g.drawImage(source, 0, 0, target.width, target.height);
+    }});
     drawCrop(slot);
   }
   updateDiagnostics();
@@ -136,13 +153,16 @@ function renderAll() {
 function updateDiagnostics() {
   const notes = topologyNotes(slots.before.state, slots.after.state);
   const perSlot = Object.fromEntries(SLOTS.map(slot => {
-    const {state, raw, applied, entry, view} = slots[slot];
+    const {state, raw, applied, entry} = slots[slot];
     $(`label-${slot}`).textContent = entry.label;
-    return [slot, {label: entry.label, coreVersion: state.version, mocVersion: state.mocVersion, modelCanvas: state.canvas, viewCanvasPx: view,
+    return [slot, {label: entry.label, coreVersion: state.version, mocVersion: state.mocVersion, modelCanvas: state.canvas, viewCanvasPx: shared.view,
       drawables: state.drawableIds.length, parameters: state.parameters.length, parts: state.parts.length,
       appliedReadBack: applied, nonDefaultPartOpacities: partOpacityDiff(raw, state)}];
   }));
+  const requested = Object.keys(currentPose.parameters);
+  const missing = SLOTS.filter(slot => requested.some(id => !(id in slots[slot].applied)));
   $('diag').textContent = JSON.stringify({mode: config.mode, note: config.note, pose: currentPose, camera, crop,
+    applyCheck: missing.length ? `REQUESTED VALUES NOT READ BACK for ${missing.join(', ')}` : 'requested values read back from Core for both models',
     topology: notes.length ? notes : ['same drawable IDs, parameter IDs and canvas size'],
     reminder: 'Visual differences never override an export-audit incompatibility and do not judge anatomy.', models: perSlot}, null, 1);
 }
@@ -156,7 +176,7 @@ function readCrop() {
 async function downloadPng() {
   if (!slots.before || !slots.after) return;
   renderAll();
-  const a = slots.before.app.view, cropA = $('crop-before');
+  const a = $('view-before'), cropA = $('crop-before');
   const pad = 8, header = 28, width = pad * 3 + a.width * 2, height = header + pad * 3 + a.height + cropA.height;
   const out = document.createElement('canvas'); out.width = width; out.height = height;
   const g = out.getContext('2d');
@@ -165,7 +185,7 @@ async function downloadPng() {
   g.fillText(`raw-core | pose ${currentPose.name} | ${JSON.stringify(currentPose.parameters)}`, pad, 18);
   SLOTS.forEach((slot, i) => {
     const x = pad + i * (a.width + pad);
-    g.drawImage(slots[slot].app.view, x, header + pad);
+    g.drawImage($(`view-${slot}`), x, header + pad);
     g.drawImage($(`crop-${slot}`), x, header + pad * 2 + a.height);
     g.fillText(slots[slot].entry.label, x + 4, header + pad + 16);
   });

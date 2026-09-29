@@ -11,7 +11,7 @@ import {fileURLToPath} from 'node:url';
 import {declaredReferences, resolveReferences, parsePoses, readBounded, safeLabel, AuditError} from '../src/export-audit.mjs';
 
 const PREVIEW_DIR = fileURLToPath(new URL('../preview/', import.meta.url));
-export const PREVIEW_FILES = Object.freeze(['index.html', 'app.mjs', 'pose-core.mjs', 'load-guard.mjs', 'style.css']);
+export const PREVIEW_FILES = Object.freeze(['index.html', 'app.mjs', 'pose-core.mjs', 'load-guard.mjs', 'render-step.mjs', 'style.css']);
 export const SLOTS = Object.freeze(['before', 'after']);
 const VENDOR = Object.freeze({core: 'core.js', pixi: 'pixi.js', live2dDisplay: 'live2d-display.js'});
 // Optional fourth vendor: the local @pixi/unsafe-eval helper, loaded after Pixi so no 'unsafe-eval' CSP is needed.
