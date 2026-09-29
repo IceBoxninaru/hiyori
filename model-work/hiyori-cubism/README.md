@@ -143,3 +143,118 @@ trip.
 
 Reports, pose files and exports stay local. This folder's `.gitignore` covers `reports/`,
 `local/`, `out/`, `source/`, `report*.json`, `*.report.json` and `poses*.json`.
+
+# Native export pose comparison preview (local diagnostic)
+
+A local, read-only harness that shows **two native SDK exports** (before/after) side by
+side at **fixed named poses**, rendered by the existing local Pixi + pixi-live2d-display +
+Cubism Core. It is a diagnostic viewer. It is not a rig, does not correct geometry, and
+does not judge anatomy. Pixel differences say nothing about shoulder quality.
+
+It never overrides the export audit: if the audit reports `incompatible`, a visual
+difference here is not an edit witness. A topology difference between the two exports is
+shown as a warning and does not block viewing.
+
+## Launch (local only)
+
+```sh
+node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
+  --before <before-export>/<name>.model3.json --after <after-export>/<name>.model3.json \
+  --poses <local-poses.json> --port 5190 \
+  --core <local>/live2dcubismcore.min.js --pixi <local>/pixi.min.js \
+  --live2d-display <local>/cubism4.min.js --pixi-unsafe-eval <local>/pixi-unsafe-eval.min.js \
+  [--camera <local-camera.json>]
+# then open http://127.0.0.1:5190/
+```
+
+- `--pixi` is a Pixi v6 UMD build and `--live2d-display` is the pixi-live2d-display
+  0.4.0 Cubism4 UMD build, both already present locally (no CDN, no install).
+- `--pixi-unsafe-eval` (optional, but needed in practice) is the local
+  `@pixi/unsafe-eval` helper for the same Pixi version. It is served as the fourth exact
+  vendor file and loaded right after Pixi, so the CSP needs no `'unsafe-eval'`. Without
+  it, Pixi 6 shader setup is expected to fail under the CSP, and the page says so.
+- `--port` is required and must be 1–65535. The server binds **127.0.0.1 only** and
+  exits if the port is busy.
+- `--camera` (optional) is
+  `{"version":1,"zoom":1,"centerX":0.5,"centerY":0.5,"crop":{"x":0.25,"y":0.18,"w":0.3,"h":0.22}}`.
+  All values are in normalized **before**-model canvas coordinates. Without it, the
+  camera is derived once from the before model's canvas info (full body, centred), and
+  the default shoulder crop is a starting guess that you adjust in the page.
+- The poses file uses the audit's shape:
+  `{"version":1,"poses":[{"name":"shrug","parameters":{"ParamShoulder":1}}]}`. A
+  `default` pose (all declared defaults) is always offered first.
+
+## Specification (implemented)
+
+**Serving:**
+- Exact routes only:
+  - `/` (the page);
+  - `/app/<file>` for the fixed files in `preview/`;
+  - `/vendor/core.js`, `/vendor/pixi.js`, `/vendor/live2d-display.js`, plus
+    `/vendor/pixi-unsafe-eval.js` only when `--pixi-unsafe-eval` is given;
+  - `/config.json`;
+  - `/m/<before|after>/r/<n>.<ext>` for each model3's declared **Moc and Textures only**.
+- Model resources are served through opaque aliases. Physics, pose, motion, expression,
+  sound, `.cmo3`, `.env`, directories and anything else return 404. There are no write
+  endpoints: methods other than GET/HEAD get 405.
+- Requests whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` get 421.
+  Absolute-form or otherwise malformed URLs get 400.
+- No CORS headers, and `nosniff`. A strict CSP: `connect-src 'self'`, no external
+  origins, no `'unsafe-eval'`; only `'wasm-unsafe-eval'`, which Core needs for its
+  WebAssembly.
+- References are validated with the audit's `declaredReferences` rules: URL, absolute,
+  drive, UNC, `..` and backslash references are rejected. Each file's realpath must stay
+  inside its model directory; directory links and Windows junctions are resolved by
+  realpath.
+- The realpath is checked again on every request, so a file swapped for an escaping link
+  after startup is refused.
+- Startup fails closed with a stable code if a model, a declared Moc/Texture, the poses
+  file or any vendor file is missing or invalid.
+- Errors never contain absolute paths. `/config.json` contains only aliases, redacted
+  labels, poses and camera numbers.
+
+**Poses** (`preview/pose-core.mjs`, pure and unit-tested):
+- The server validates pose shape with the audit's `parsePoses`.
+- The page validates IDs and ranges against each model's actual Core parameters.
+  Unknown IDs and out-of-range values are errors, never clamped.
+- Declared defaults are captured from a separately instantiated raw Core model: parameter
+  `defaultValues` and the fresh part opacities.
+- Every render resets **all** parameters and part opacities to those captured defaults,
+  then applies the named values and reads them back. Results cannot depend on pose order
+  or history.
+
+**Rendering (raw-core mode only):**
+- The Pixi model is created from a settings object containing just Moc and Textures,
+  with `autoInteract:false`, `autoUpdate:false` and `motionPreload:'none'`.
+- The Pixi application is created with `autoStart:false` and `sharedTicker:false`, and
+  `interaction.useSystemTicker` is disabled. The raw Core model is read through
+  `internalModel.coreModel.getModel()`, as the current app does.
+- Its `internalModel.update` is replaced by the deterministic reset/apply/Core update
+  above. So motion, idle, expressions, blinking, breath, physics, SDK Pose, gaze/focus
+  and natural movement are all off.
+- Because SDK Pose is disabled, **both A and B arm parts can be visible**. The page says
+  so; nothing is hidden.
+- One camera (scale/position) is derived once from the **before** canvas info or the
+  explicit `--camera`, applied identically to both models, and never re-fitted per pose.
+  The same normalized shoulder crop is magnified for both.
+- Background: white or dark.
+- "Download PNG" composes the current before/after view and crops into a local file in
+  the browser. Nothing is uploaded.
+- Diagnostics: mode, labels, model canvas and view dimensions, Core version, moc version,
+  applied parameter values read back from Core, non-default part opacities, and a
+  topology/ID difference warning.
+- Reloading uses a generation guard: a stale asynchronous load is destroyed on arrival,
+  and old models/applications are destroyed before replacement.
+
+**Tests:** `tests/native-preview.test.mjs` is offline and synthetic. It covers pose
+validation, reset and order independence, stale-load disposal, exact serving,
+traversal/URL/junction escapes, unknown files, Host checks, path redaction, and safe
+missing-vendor/model failures. A fake Core and fake loads are **not** evidence of real
+WebGL, Pixi or texture rendering, which is verified locally.
+
+**Local checks for the coordinator:**
+- before vs before is identical across pose orderings;
+- the edited export differs at `ParamShoulder=1` but not at 0;
+- real Core/Pixi rendering with textures;
+- an identical shoulder crop camera for before and after;
+- no app behaviour changes.

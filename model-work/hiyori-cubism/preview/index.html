@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Native Export Preview</title>
+<link rel="stylesheet" href="/app/style.css">
+</head>
+<body>
+<header>
+  <strong>Native export pose comparison</strong> <span class="tag">local diagnostic · raw Core mode</span>
+  <p id="note" class="warn"></p>
+</header>
+<section class="controls">
+  <label>Pose <select id="pose"></select></label>
+  <label>Background <select id="bg"><option value="white">white</option><option value="dark">dark</option></select></label>
+  <fieldset><legend>Shoulder crop (normalized before-canvas, shared)</legend>
+    <label>x <input id="cx" type="number" step="0.01"></label>
+    <label>y <input id="cy" type="number" step="0.01"></label>
+    <label>w <input id="cw" type="number" step="0.01" min="0.01"></label>
+    <label>h <input id="ch" type="number" step="0.01" min="0.01"></label>
+  </fieldset>
+  <button id="reload" type="button">Reload models</button>
+  <button id="download" type="button">Download PNG</button>
+</section>
+<p id="error" class="error" role="alert"></p>
+<main>
+  <figure><figcaption id="label-before">before</figcaption><canvas id="view-before" width="560" height="784"></canvas><canvas id="crop-before" class="crop" width="560" height="400"></canvas></figure>
+  <figure><figcaption id="label-after">after</figcaption><canvas id="view-after" width="560" height="784"></canvas><canvas id="crop-after" class="crop" width="560" height="400"></canvas></figure>
+</main>
+<section><h2>Diagnostics</h2><pre id="diag">loading…</pre></section>
+<script src="/vendor/core.js"></script>
+<script src="/vendor/pixi.js"></script>
+<script src="/vendor/pixi-unsafe-eval.js"></script>
+<script src="/vendor/live2d-display.js"></script>
+<script type="module" src="/app/app.mjs"></script>
+</body>
+</html>
