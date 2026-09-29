@@ -1,0 +1,19 @@
+{
+  "name": "hiyori-rig-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated 2D rig source and tests. Original character assets and Cubism Core are not included.",
+  "engines": {
+    "node": ">=22.16"
+  },
+  "scripts": {
+    "build": "node model-work/hiyori-v2/tools/build-parts.mjs",
+    "serve": "node model-work/hiyori-v2/tools/serve.mjs --port=5178",
+    "test": "node --test model-work/hiyori-v2/tests/*.test.mjs",
+    "review": "node model-work/hiyori-v2/tools/render-poses.mjs all"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "1.0.9"
+  }
+}

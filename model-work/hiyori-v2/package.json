@@ -1,0 +1,15 @@
+{
+  "name": "hiyori-v2-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PROTOTYPE layered 2D bone rig for Hiyori's arms/hands over the original moc3. Not a Cubism export. Private work folder.",
+  "engines": {"node": ">=22.16"},
+  "scripts": {
+    "build": "node tools/build-parts.mjs",
+    "serve": "node tools/serve.mjs --port=5178",
+    "test": "node --test tests/*.test.mjs",
+    "review": "node tools/render-poses.mjs all",
+    "render:original": "node tools/render-original.mjs"
+  }
+}

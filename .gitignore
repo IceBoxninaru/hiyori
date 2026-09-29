@@ -1,0 +1,61 @@
+# Environment, credentials, local agent state, and personal data.
+**/.env*
+**/.claude/
+**/.codex/
+**/.hermes/
+**/.artifacts/
+**/.npmrc
+**/.netrc
+**/.git-credentials
+**/*secret*
+**/*credential*
+**/*token*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.log
+**/*.sqlite*
+**/*.db
+**/*.jsonl
+**/conversation*/
+**/memory*/
+**/sessions/
+**/screenshots/
+**/recordings/
+
+# Dependencies and generated or licensed asset directories.
+**/node_modules/
+**/source/
+**/build/
+**/out/
+**/reference/
+**/vendor/
+/public/live2d/
+/third-party/
+**/live2dcubismcore*.js
+
+# Original model files, archives, media, and diagnostic captures.
+**/*.moc3
+**/*.cmo3
+**/*.can3
+**/*.psd
+**/*.psb
+**/*.zip
+**/*.tgz
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.webp
+**/*.gif
+**/*.mp4
+**/*.webm
+**/*.wav
+**/*.mp3
+**/*.crx
+**/*.lnk
+**/.DS_Store
+**/Thumbs.db
+
+# Ignore rules do not inspect file contents. Scan all staged content and
+# commit identity for personal paths, credentials, and personal information.

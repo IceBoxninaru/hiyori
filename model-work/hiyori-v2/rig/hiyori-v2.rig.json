@@ -1,0 +1,49 @@
+{
+  "schema": "hiyori-v2-rig/1",
+  "status": "PROTOTYPE layered 2D bone rig over the original Hiyori moc3. Not a Cubism .moc3/.cmo3 export.",
+  "units": "Cubism model units (2976 canvas px per unit), +y up. L = character's left = viewer's right (x>0).",
+  "hiddenCoreParts": ["PartArmA", "PartArmB"],
+  "torsoAnchor": {"drawable": "ArtMesh99", "near": [[-0.097, 0.3], [0.085, 0.3]]},
+  "slots": {"back": null, "chest": 54, "front": 119},
+  "arms": {
+    "L": {
+      "mirror": 1,
+      "pivots": {"shoulder": [0.085, 0.3], "elbow": [0.087, 0.14], "wrist": [0.185, -0.038]},
+      "meshes": {"cap": "ArtMesh69", "upper": "ArtMesh75", "forearm": "ArtMesh77", "thumb": "ArtMesh78"},
+      "fingerStrips": {"base": "ArtMesh79", "tip": "ArtMesh76"}
+    },
+    "R": {
+      "mirror": -1,
+      "pivots": {"shoulder": [-0.097, 0.3], "elbow": [-0.108, 0.14], "wrist": [-0.155, -0.045]},
+      "meshes": {"cap": "ArtMesh68", "upper": "ArtMesh72", "forearm": "ArtMesh71", "thumb": "ArtMesh73"},
+      "fingerStrips": {"base": "ArtMesh74", "tip": "ArtMesh70"}
+    }
+  },
+  "skin": {
+    "cap":     {"axis": "upper",   "shoulder": [0.0, 1.0, 0.0]},
+    "upper":   {"axis": "upper",   "shoulder": [-0.1, 0.06, 1.0], "elbow": [0.7, 1.2, 0.75]},
+    "forearm": {"axis": "forearm", "elbow": [-0.2, 0.2, 1.0]}
+  },
+  "hand": {
+    "cuffClipOffset": 0.012,
+    "curlAngle": 14,
+    "tipCurlAngle": 28,
+    "extendAngle": 10,
+    "extendShift": 0.003,
+    "thumbCurlAngle": 30,
+    "spreadAngle": {"index": 9, "middle": 3, "ring": -3, "pinky": -9, "thumb": 12}
+  },
+  "channels": {
+    "ArmShoulder": {"min": -25, "max": 170, "rest": 0, "unit": "deg", "doc": "0 = hanging; + raises the arm outward and up"},
+    "ArmElbow":    {"min": -165, "max": 150, "rest": 0, "unit": "deg", "doc": "+ forearm rotates outward (same sense as a raise); - folds inward across the body"},
+    "ArmWrist":    {"min": -70, "max": 70, "rest": 0, "unit": "deg", "doc": "+ hand bends outward"},
+    "HandCurl":    {"min": -1, "max": 1, "rest": 0, "doc": "added to every finger curl"},
+    "FingerThumb": {"min": -1, "max": 1, "rest": 0, "doc": "+1 retracts into the sleeve (sleeve fist), -1 extends"},
+    "FingerIndex": {"min": -1, "max": 1, "rest": 0},
+    "FingerMiddle": {"min": -1, "max": 1, "rest": 0},
+    "FingerRing":  {"min": -1, "max": 1, "rest": 0},
+    "FingerPinky": {"min": -1, "max": 1, "rest": 0},
+    "FingerSpread": {"min": -1, "max": 1, "rest": 0},
+    "ArmLayer":    {"enum": ["back", "chest", "front"], "rest": "back", "doc": "draw slot of forearm + hand; upper sleeve stays behind the torso"}
+  }
+}

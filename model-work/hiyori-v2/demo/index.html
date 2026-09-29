@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hiyori v2 Workbench</title>
+<style>
+  :root { --bg: #f4f2ee; --panel: #ffffff; --ink: #24212a; --muted: #6d6875; --line: #e2ddd6; --accent: #c0144a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { font: 13px/1.45 system-ui, "Segoe UI", "Hiragino Sans", sans-serif; color: var(--ink); background: var(--bg); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; height: 100vh; }
+  #stage { position: relative; overflow: hidden; min-width: 0; }
+  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #overlay { pointer-events: none; }
+  aside { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; overflow-x: hidden; padding: 12px 14px 40px; min-width: 0; }
+  .notice { background: #fff8e1; border: 1px solid #e7c96a; padding: 8px 10px; border-radius: 6px; font-size: 12px; }
+  h2 { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 16px 0 6px; }
+  h3 { font-size: 12px; margin: 10px 0 4px; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  button { font: inherit; padding: 4px 8px; border: 1px solid var(--line); background: #faf9f7; border-radius: 6px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  label.ch { display: grid; grid-template-columns: 84px minmax(0, 1fr) 40px; gap: 6px; align-items: center; margin: 1px 0; }
+  label.ch > span:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
+  input[type=range], select { width: 100%; min-width: 0; }
+  pre { background: #f7f5f2; border: 1px solid var(--line); padding: 8px; border-radius: 6px; font-size: 11px; max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+  .note { color: var(--muted); font-size: 12px; margin: 4px 0; }
+  #error { color: #b00020; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <canvas id="overlay"></canvas>
+  </div>
+  <aside>
+    <div class="notice"><b>PROTOTYPE</b>: original Hiyori moc3 + v2 layered bone rig for the arms. Not a modified moc3.
+      Finger sliders are prototype controls on original finger pixels. "Fist" is a <b>sleeve fist</b>: the fingers retract into the sleeve.
+      "Point" means a single original fingertip left out of the cuff. A natural open palm, an anatomical fist and a straight pointing index need new artwork (future work).</div>
+    <div id="error"></div>
+    <h2>Gestures (closed catalog)</h2>
+    <div class="row" id="gestures"></div>
+    <div class="row" style="margin-top:6px">
+      <button id="stop">Stop (ease)</button><button id="stopNow">Stop (immediate)</button><button id="reset">Reset</button>
+    </div>
+    <h2>Lifecycle / view</h2>
+    <div class="row">
+      <label><input type="checkbox" id="reduced"> reduced motion</label>
+      <label><input type="checkbox" id="bones"> bones</label>
+      <label><input type="checkbox" id="dark"> dark bg</label>
+    </div>
+    <label class="ch"><span>mouth (audio)</span><input type="range" id="mouth" min="0" max="1" step="0.01" value="0"><span id="mouthV">0</span></label>
+    <label class="ch"><span>speed</span><input type="range" id="speed" min="0.1" max="1.5" step="0.05" value="1"><span id="speedV">1</span></label>
+    <label class="ch"><span>zoom</span><input type="range" id="zoom" min="0.5" max="8" step="0.05" value="0.85"><span id="zoomV">0.85</span></label>
+    <div class="row"><button data-focus="full">full body</button><button data-focus="upper">upper body</button><button data-focus="handL">hand L</button><button data-focus="handR">hand R</button></div>
+    <h2>Manual pose (workbench)</h2>
+    <p class="note">L = character's left (viewer's right). A slider stops the gesture and holds the pose; Stop/Reset/gesture clears it.</p>
+    <div id="chL"></div>
+    <div id="chR"></div>
+    <h2>State</h2>
+    <pre id="state"></pre>
+  </aside>
+</main>
+<script src="/vendor/live2dcubismcore.js"></script>
+<script type="module" src="./workbench.mjs"></script>
+</body>
+</html>
