@@ -29,15 +29,17 @@ node model-work/hiyori-cubism/tools/audit-export.mjs --model <local.model3.json>
 
 The reusable library must not execute a CLI or initialize Core when imported. `--help` documents options and evidence limitations. Normal successful inspection exits 0. Invalid input, missing assets, unsupported/invalid moc3, Core initialization errors or unmet `--require-pose-change` exit nonzero. A machine-readable report may contain explicit failure states but never call missing checks passed. Do not print raw exception stacks containing personal absolute paths; use concise stable error codes and referenced relative names. Do not overwrite input files or let the report output alias a referenced source asset.
 
-Report schema includes schema version; model-relative file references with byte lengths and SHA-256; actual Core version and supported/moc version; actual parameter IDs/minimum/maximum/default; part/drawable counts; named pose measurements; and optional baseline comparison. Reports contain no absolute paths, environment values or timestamps needed for deterministic comparison. Store no screenshots, model buffers or textures inside reports.
+Report schema includes schema version; model-relative file references with byte lengths and SHA-256; trusted Core SHA-256, actual Core version and supported/moc version; actual parameter IDs/minimum/maximum/default; part/drawable counts; named pose measurements; and optional baseline comparison. Reports contain no absolute paths, environment values or timestamps needed for deterministic comparison. Store no screenshots, model buffers or textures inside reports.
 
 ## Asset and structure checks
 
 1. Parse actual model3 JSON with Version 3, a non-empty FileReferences.Moc and non-empty Textures array. Resolve from the model3 directory, never cwd.
-2. Validate existence of Moc, all Textures, and every declared Physics, Pose, DisplayInfo, Expressions[].File, Motions[group][].File and optional motion Sound. Report all checked references. Reject malformed declared entries instead of silently skipping them.
+2. Validate existence of Moc, all Textures, and every declared Physics, Pose, DisplayInfo, UserData, Expressions[].File, Motions[group][].File and optional motion Sound. Report all checked references. Reject malformed declared entries instead of silently skipping them. The original local Hiyori model declares 16 file references (1 moc, 2 textures, physics, pose, display info, 10 motions); do not hard-code that as a universal count.
 3. Reject URLs, absolute/drive/UNC paths and references escaping the model directory. Resolve real paths to reject symlink escapes before opening files. Bounded model/pose/report JSON sizes should avoid accidental huge reads. Accept ordinary nested paths. Do not search surrounding directories for missing assets.
 4. Inspect moc3 through the trusted local Core. Detect malformed/unsupported files before treating a model as usable; use documented available consistency/version functions if present and report when a check is unavailable. Release Model/Moc in finally on both success and failure.
 5. Require finite and coherent actual parameter ranges/defaults and finite geometry; unknown or out-of-range requested pose values are errors, not clamped successes. No invented native parameter IDs.
+
+Check Model.fromMoc as well as Moc.fromArrayBuffer for null. In the coordinator's Core inspection, moc consistency is an instance method, not a static Moc method. Check actual runtime capabilities rather than guessing API names. Validate drawable IDs, XY/UV lengths, finite values, triangle-index bounds, texture indices and mask references. Degenerate triangles/internal overlap alone are not proof of a visible defect.
 
 ## Pose evidence
 
@@ -52,6 +54,8 @@ At most 12 uniquely named poses, bounded parameter count, finite numeric values.
 Comparison must distinguish identical moc bytes, changed bytes with identical sampled poses, genuinely changed sampled geometry, and incompatible pose inputs/topology. A new file hash alone is not proof that an edited key reached the runtime. `--require-pose-change` succeeds only for comparable reports with at least one requested pose's actual geometry changed; metadata-only differences and missing/incompatible evidence fail. Different Core versions or pose inputs are not directly comparable. Clearly state that numeric differences do not prove shoulder quality, valid cmo3 editing, Editor save/reopen, SDK export provenance, or correct browser rendering.
 
 Keep `coreCompatible` and `editProof` separate: an unedited Editor round trip may legitimately produce identical moc bytes and still prove runtime compatibility. It simply provides no editing witness. Pose geometry changes must be attributed to named drawable IDs; mouth-only or unrelated changes must not be described as shoulder repair.
+
+Report that snapshots are raw Core deformation only: SDK Pose switching, physics, motion and blink are not applied. In particular the original Hiyori Pose switches arm parts, so raw Core neutral is not necessarily its final visible SDK neutral. Never label a mesh digest as successful Web rendering.
 
 ## Tests and review
 
