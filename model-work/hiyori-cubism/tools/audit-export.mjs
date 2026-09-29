@@ -5,7 +5,7 @@
 import {readFile, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {runAudit, sha256, LIMITATIONS} from '../src/export-audit.mjs';
+import {runAudit, sha256, LIMITATIONS, LIBRARY_FILE} from '../src/export-audit.mjs';
 
 const HELP = `Native Cubism export audit (raw Core measurement, local only)
 
@@ -38,13 +38,15 @@ export function parseArgs(argv) {
     if (arg === '--require-pose-change') { opts.requirePoseChange = true; continue; }
     const [flag, inline] = arg.includes('=') ? [arg.slice(0, arg.indexOf('=')), arg.slice(arg.indexOf('=') + 1)] : [arg, null];
     const key = takes[flag];
-    if (!key) return {error: `unknown option ${flag}`};
+    if (!key) return {error: /^--?[a-z][a-z-]{0,40}$/.test(flag) ? `unknown option ${flag}` : 'unknown argument (value redacted)'};
     const value = inline ?? argv[++i];
     if (!value) return {error: `${flag} needs a value`};
     opts[key] = value;
   }
   return opts;
 }
+
+const LOADER = fileURLToPath(new URL('../../hiyori-v2/src/cubism-core-node.mjs', import.meta.url));
 
 async function loadTrustedCore() {
   const {loadCubismCore, corePath} = await import('../../hiyori-v2/src/cubism-core-node.mjs');
@@ -56,7 +58,10 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) { process.stdout.write(HELP); return 0; }
   if (opts.error) { process.stderr.write(`E_USAGE: ${opts.error}\n(see --help)\n`); return 64; }
-  const {report, exitCode, writeTo} = await runAudit({...opts, loadCore: loadTrustedCore});
+  // Importing the loader only resolves paths; Core initializes in loadTrustedCore.
+  const {corePath} = await import('../../hiyori-v2/src/cubism-core-node.mjs');
+  const protectedPaths = [corePath, LOADER, fileURLToPath(import.meta.url), LIBRARY_FILE];
+  const {report, exitCode, writeTo} = await runAudit({...opts, loadCore: loadTrustedCore, protectedPaths});
   if (writeTo) await writeFile(writeTo, JSON.stringify(report, null, 2) + '\n');
   for (const e of report.errors) process.stderr.write(`${e.code}${e.ref ? ` ${e.ref}` : ''}${e.detail ? `: ${e.detail}` : ''}\n`);
   const c = report.comparison;

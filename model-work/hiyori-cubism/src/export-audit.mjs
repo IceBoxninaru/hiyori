@@ -10,6 +10,7 @@
 import {createHash} from 'node:crypto';
 import {promises as fsp} from 'node:fs';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 export const SCHEMA = 'hiyori-cubism-export-audit/1';
 export const LIMITS = Object.freeze({
@@ -24,6 +25,10 @@ export const LIMITATIONS = Object.freeze([
   'invertedVsDefault counts triangles whose orientation flipped against the default pose; internal or hidden overlap is not proof of a visible defect.',
 ]);
 const POSE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const SAFE_ID = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+// Untrusted strings (references, IDs, names) are echoed only when they cannot
+// carry a path, URL or drive; otherwise a fixed placeholder is reported.
+export const safeLabel = v => typeof v === 'string' && SAFE_ID.test(v) ? v : '<redacted>';
 const EPS_AREA = 1e-9;
 
 export class AuditError extends Error {
@@ -67,13 +72,15 @@ async function readJson(file, limit, code, label) {
 const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // Validates one model-relative reference string; returns its normalized form.
-export function checkReference(ref) {
-  if (typeof ref !== 'string' || !ref.length || ref.includes('\0')) fail('E_REF_MALFORMED', 'not a non-empty string', typeof ref === 'string' ? ref : null);
-  if (/^[A-Za-z]:/.test(ref) || ref.startsWith('/') || ref.startsWith('\\') || ref.startsWith('//')) fail('E_REF_ABSOLUTE', '', ref);
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(ref)) fail('E_REF_URL', '', ref);
-  if (ref.includes('\\')) fail('E_REF_MALFORMED', 'backslash separators are not accepted', ref);
+// label: a stable, non-sensitive description of where the reference was
+// declared (e.g. "texture[1]"); the rejected string itself is never reported.
+export function checkReference(ref, label = 'reference') {
+  if (typeof ref !== 'string' || !ref.length || ref.includes('\0')) fail('E_REF_MALFORMED', 'not a non-empty string', label);
+  if (/^[A-Za-z]:/.test(ref) || ref.startsWith('/') || ref.startsWith('\\') || ref.startsWith('//')) fail('E_REF_ABSOLUTE', 'value redacted', label);
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(ref)) fail('E_REF_URL', 'value redacted', label);
+  if (ref.includes('\\')) fail('E_REF_MALFORMED', 'backslash separators are not accepted; value redacted', label);
   const normal = path.posix.normalize(ref);
-  if (normal === '..' || normal.startsWith('../') || normal === '.') fail('E_REF_ESCAPE', '', ref);
+  if (normal === '..' || normal.startsWith('../') || normal === '.') fail('E_REF_ESCAPE', 'value redacted', label);
   return normal;
 }
 
@@ -84,7 +91,8 @@ export function declaredReferences(model3) {
   const refs = model3.FileReferences;
   if (!isObject(refs)) fail('E_MODEL_SCHEMA', 'FileReferences missing');
   const out = [];
-  const add = (kind, value) => { out.push({kind, ref: checkReference(value)}); };
+  const seen = {};
+  const add = (kind, value) => { const n = seen[kind] = (seen[kind] ?? -1) + 1; out.push({kind, ref: checkReference(value, `${kind}[${n}]`)}); };
   if (typeof refs.Moc !== 'string' || !refs.Moc) fail('E_MODEL_SCHEMA', 'FileReferences.Moc must be a non-empty string');
   add('moc', refs.Moc);
   if (!Array.isArray(refs.Textures) || !refs.Textures.length) fail('E_MODEL_SCHEMA', 'FileReferences.Textures must be a non-empty array');
@@ -102,9 +110,9 @@ export function declaredReferences(model3) {
   if ('Motions' in refs) {
     if (!isObject(refs.Motions)) fail('E_REF_MALFORMED', 'Motions must be an object of groups');
     for (const [group, list] of Object.entries(refs.Motions)) {
-      if (!Array.isArray(list)) fail('E_REF_MALFORMED', `motion group ${group} must be an array`);
+      if (!Array.isArray(list)) fail('E_REF_MALFORMED', `motion group ${safeLabel(group)} must be an array`);
       for (const m of list) {
-        if (!isObject(m)) fail('E_REF_MALFORMED', `motion entry in ${group}`);
+        if (!isObject(m)) fail('E_REF_MALFORMED', `motion entry in ${safeLabel(group)}`);
         add('motion', m.File);
         if ('Sound' in m) add('sound', m.Sound);
       }
@@ -133,20 +141,20 @@ export async function resolveReferences(modelDirReal, refs) {
 
 export function parsePoses(json) {
   if (!isObject(json) || json.version !== 1 || !Array.isArray(json.poses)) fail('E_POSES_SCHEMA', 'expected {"version":1,"poses":[...]}');
-  for (const key of Object.keys(json)) if (!['version', 'poses'].includes(key)) fail('E_POSES_SCHEMA', `unknown key ${key}`);
+  for (const key of Object.keys(json)) if (!['version', 'poses'].includes(key)) fail('E_POSES_SCHEMA', `unknown key ${safeLabel(key)}`);
   if (json.poses.length > LIMITS.poses) fail('E_POSES_SCHEMA', `at most ${LIMITS.poses} poses`);
   const names = new Set();
   return json.poses.map(p => {
     if (!isObject(p)) fail('E_POSES_SCHEMA', 'pose must be an object');
-    for (const key of Object.keys(p)) if (!['name', 'parameters'].includes(key)) fail('E_POSES_SCHEMA', `unknown pose key ${key}`);
-    if (typeof p.name !== 'string' || !POSE_NAME.test(p.name) || p.name === 'default') fail('E_POSE_NAME', 'invalid or reserved name', typeof p.name === 'string' ? p.name.slice(0, 64) : null);
+    for (const key of Object.keys(p)) if (!['name', 'parameters'].includes(key)) fail('E_POSES_SCHEMA', `unknown pose key ${safeLabel(key)}`);
+    if (typeof p.name !== 'string' || !POSE_NAME.test(p.name) || p.name === 'default') fail('E_POSE_NAME', 'invalid or reserved name', p.name === 'default' ? 'default' : '<redacted>');
     if (names.has(p.name)) fail('E_POSE_NAME', 'duplicate name', p.name);
     names.add(p.name);
     if (!isObject(p.parameters)) fail('E_POSES_SCHEMA', 'parameters must be an object', p.name);
     const entries = Object.entries(p.parameters);
     if (!entries.length || entries.length > LIMITS.poseParameters) fail('E_POSES_SCHEMA', `1..${LIMITS.poseParameters} parameters`, p.name);
-    for (const [id, v] of entries) if (typeof v !== 'number' || !Number.isFinite(v)) fail('E_POSE_VALUE', `non-finite value for ${id}`, p.name);
-    return {name: p.name, parameters: Object.fromEntries(entries)};
+    for (const [id, v] of entries) if (typeof v !== 'number' || !Number.isFinite(v)) fail('E_POSE_VALUE', `non-finite value for ${safeLabel(id)}`, p.name);
+    return {name: p.name, parameters: Object.fromEntries(entries.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))};
   });
 }
 
@@ -172,22 +180,6 @@ export function inspectMoc(core, mocBytes, {textureCount, poses = []}) {
   const buffer = mocBytes.buffer.slice(mocBytes.byteOffset, mocBytes.byteOffset + mocBytes.byteLength);
   const checks = {version: {raw: version, text: coreVersionText(version)}, latestMocVersion: latest, mocVersion: null,
     versionCheck: 'unavailable', consistency: 'unavailable', unavailable: []};
-  if (fn(core?.Version, 'csmGetMocVersion')) {
-    checks.mocVersion = core.Version.csmGetMocVersion(buffer);
-    if (!Number.isInteger(checks.mocVersion) || checks.mocVersion <= 0) fail('E_MOC_INVALID', 'unknown moc3 version');
-    if (Number.isInteger(latest)) {
-      checks.versionCheck = checks.mocVersion <= latest ? 'passed' : 'failed';
-      if (checks.versionCheck === 'failed') fail('E_MOC_UNSUPPORTED', `moc version ${checks.mocVersion} > supported ${latest}`);
-    }
-  }
-  if (checks.versionCheck === 'unavailable') checks.unavailable.push('mocVersion');
-  // Consistency is an instance method in the inspected Core; call it the way the
-  // official Framework does (through the prototype) and only if it exists.
-  const proto = core?.Moc?.prototype;
-  if (fn(proto, 'hasMocConsistency')) {
-    checks.consistency = proto.hasMocConsistency.call(proto, buffer) === 1 ? 'passed' : 'failed';
-    if (checks.consistency === 'failed') fail('E_MOC_INCONSISTENT', 'hasMocConsistency returned false');
-  } else checks.unavailable.push('mocConsistency');
   if (!fn(core?.Moc, 'fromArrayBuffer') || !fn(core?.Model, 'fromMoc')) fail('E_CORE_API', 'Moc.fromArrayBuffer/Model.fromMoc missing');
 
   let moc = null;
@@ -198,9 +190,28 @@ export function inspectMoc(core, mocBytes, {textureCount, poses = []}) {
     models.push(model);
     return model;
   };
+  // Calls a Core function; a throw inside Core becomes a stable code (no message).
+  const coreCall = (code, detail, call) => { try { return call(); } catch { fail(code, detail); } };
   try {
-    moc = core.Moc.fromArrayBuffer(buffer);
+    // Consistency is an instance method in the inspected Core; call it the way
+    // the official Framework does (through the prototype, before creating the moc).
+    const proto = core.Moc.prototype;
+    if (fn(proto, 'hasMocConsistency')) {
+      checks.consistency = coreCall('E_MOC_INVALID', 'hasMocConsistency threw', () => proto.hasMocConsistency(buffer)) === 1 ? 'passed' : 'failed';
+      if (checks.consistency === 'failed') fail('E_MOC_INCONSISTENT', 'hasMocConsistency returned false');
+    } else checks.unavailable.push('mocConsistency');
+    moc = coreCall('E_MOC_INVALID', 'Moc.fromArrayBuffer threw', () => core.Moc.fromArrayBuffer(buffer));
     if (!moc) fail('E_MOC_INVALID', 'Moc.fromArrayBuffer returned null');
+    // Core 5.1: csmGetMocVersion(moc, mocBytes) reads mocBytes.byteLength.
+    if (fn(core?.Version, 'csmGetMocVersion')) {
+      checks.mocVersion = coreCall('E_MOC_INVALID', 'csmGetMocVersion threw', () => core.Version.csmGetMocVersion(moc, buffer));
+      if (!Number.isInteger(checks.mocVersion) || checks.mocVersion <= 0) fail('E_MOC_INVALID', 'unknown moc3 version');
+      if (Number.isInteger(latest)) {
+        checks.versionCheck = checks.mocVersion <= latest ? 'passed' : 'failed';
+        if (checks.versionCheck === 'failed') fail('E_MOC_UNSUPPORTED', `moc version ${checks.mocVersion} > supported ${latest}`);
+      }
+    }
+    if (checks.versionCheck === 'unavailable') checks.unavailable.push('mocVersion');
     // Native initial state from a freshly instantiated model.
     const first = instantiate();
     const p = first.parameters;
@@ -208,11 +219,11 @@ export function inspectMoc(core, mocBytes, {textureCount, poses = []}) {
     const initialValues = Float64Array.from(p.values);
     const partIds = [...first.parts.ids], initialPartOpacities = Float64Array.from(first.parts.opacities);
     validateParameters(parameters, initialValues);
-    for (const [i, o] of initialPartOpacities.entries()) if (!finite(o)) fail('E_STRUCTURE', 'non-finite part opacity', partIds[i]);
+    for (const [i, o] of initialPartOpacities.entries()) if (!finite(o)) fail('E_STRUCTURE', 'non-finite part opacity', safeLabel(partIds[i]));
     const byId = new Map(parameters.map((q, i) => [q.id, {...q, index: i}]));
     for (const pose of poses) for (const [id, v] of Object.entries(pose.parameters)) {
       const q = byId.get(id);
-      if (!q) fail('E_POSE_UNKNOWN_PARAM', `unknown parameter ${id}`, pose.name);
+      if (!q) fail('E_POSE_UNKNOWN_PARAM', `unknown parameter ${safeLabel(id)}`, pose.name);
       if (v < q.min || v > q.max) fail('E_POSE_RANGE', `${id}=${v} outside [${q.min}, ${q.max}]`, pose.name);
     }
     releaseModel(models.pop());
@@ -258,9 +269,9 @@ function releaseModel(model) {
 function validateParameters(parameters, initialValues) {
   const seen = new Set();
   for (const [i, q] of parameters.entries()) {
-    if (typeof q.id !== 'string' || !q.id || seen.has(q.id)) fail('E_STRUCTURE', 'invalid or duplicate parameter id', typeof q.id === 'string' ? q.id : null);
+    if (typeof q.id !== 'string' || !q.id || seen.has(q.id)) fail('E_STRUCTURE', 'invalid or duplicate parameter id', safeLabel(q.id));
     seen.add(q.id);
-    if (![q.min, q.max, q.default, initialValues[i]].every(finite) || q.min > q.max || q.default < q.min || q.default > q.max) fail('E_STRUCTURE', 'incoherent parameter range/default', q.id);
+    if (![q.min, q.max, q.default, initialValues[i]].every(finite) || q.min > q.max || q.default < q.min || q.default > q.max) fail('E_STRUCTURE', 'incoherent parameter range/default', safeLabel(q.id));
   }
 }
 
@@ -274,7 +285,7 @@ function readDrawables(model, textureCount) {
   const ids = new Set(), drawables = [], dynamic = [], areas = [];
   for (let i = 0; i < count; i++) {
     const id = d.ids[i];
-    if (typeof id !== 'string' || !id || ids.has(id)) fail('E_STRUCTURE', 'invalid or duplicate drawable id', typeof id === 'string' ? id : null);
+    if (typeof id !== 'string' || !id || ids.has(id)) fail('E_STRUCTURE', 'invalid or duplicate drawable id', safeLabel(id));
     ids.add(id);
     const xy = d.vertexPositions[i], uv = d.vertexUvs[i], idx = d.indices[i];
     if (!xy || xy.length % 2 || !uv || uv.length !== xy.length) fail('E_STRUCTURE', 'XY/UV length mismatch', id);
@@ -300,9 +311,13 @@ function readDrawables(model, textureCount) {
     dynamic.push({id, geometrySha: floatDigest(xy), bbox: n ? [minX, minY, maxX, maxY].map(round6) : null, opacity: round6(opacity),
       renderOrder: orders ? orders[i] : null});
   }
-  const signature = sha256(JSON.stringify(drawables));
+  // Canonical: identity by drawable ID, independent of Core array order.
+  const signature = sha256(JSON.stringify([...drawables].sort((a, b) => a.id < b.id ? -1 : 1).map(d => ({...d, masks: [...d.masks].sort()}))));
   return {structure: {drawables, signature, renderOrderSource}, dynamic, areas};
 }
+
+const byNameOrder = list => [...list].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+const byIdOrder = list => [...list].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 function poseRecord(pose, snapshot, defaultAreas, model) {
   const drawables = snapshot.dynamic.map((dyn, i) => {
@@ -313,8 +328,8 @@ function poseRecord(pose, snapshot, defaultAreas, model) {
   });
   const partOpacities = Float64Array.from(model.parts.opacities);
   return {name: pose.name, parameters: pose.parameters,
-    geometrySignature: sha256(drawables.map(d => d.geometrySha).join('')),
-    stateSignature: sha256(JSON.stringify(drawables.map(d => [d.id, d.opacity, d.renderOrder])) + floatDigest(partOpacities)),
+    geometrySignature: sha256(JSON.stringify(byIdOrder(drawables).map(d => [d.id, d.geometrySha]))),
+    stateSignature: sha256(JSON.stringify(byIdOrder(drawables).map(d => [d.id, d.opacity, d.renderOrder])) + floatDigest(partOpacities)),
     drawables};
 }
 
@@ -328,24 +343,35 @@ export function compareReports(current, baseline) {
   if (!Array.isArray(baseline.poses) || !Array.isArray(baseline.references)) return incompatible('baseline is missing poses or references');
   if (baseline.status !== 'ok' || current.status !== 'ok') return incompatible('both reports must have status ok');
   if (baseline.core?.sha256 !== current.core?.sha256 || baseline.core?.version?.raw !== current.core?.version?.raw) return incompatible('different trusted Core file or version');
-  const poseKey = r => JSON.stringify(r.poses.map(p => [p.name, p.parameters]));
+  const canonParams = obj => JSON.stringify(Object.entries(obj ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+  const poseKey = r => JSON.stringify(r.poses.map(p => [p.name, canonParams(p.parameters)]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
   if (poseKey(baseline) !== poseKey(current)) return incompatible('different pose inputs');
   if (baseline.structure?.signature !== current.structure?.signature) return incompatible('different drawable identity/topology/UV/texture/mask structure');
   const mocSha = r => r.references.find(x => x.kind === 'moc')?.sha256;
   out.mocBytesIdentical = mocSha(baseline) === mocSha(current);
-  for (const pose of current.poses) {
-    const before = new Map(baseline.poses.find(p => p.name === pose.name).drawables.map(d => [d.id, d]));
+  const baselinePoses = new Map(baseline.poses.map(p => [p.name, p]));
+  for (const pose of byNameOrder(current.poses)) {
+    const before = new Map(baselinePoses.get(pose.name).drawables.map(d => [d.id, d]));
     const geometry = [], state = [];
-    for (const d of pose.drawables) {
+    for (const d of byIdOrder(pose.drawables)) {
       const b = before.get(d.id);
+      if (!b) return incompatible(`drawable ${safeLabel(d.id)} missing from baseline pose ${pose.name}`);
       if (b.geometrySha !== d.geometrySha) geometry.push({id: d.id, bboxBefore: b.bbox, bboxAfter: d.bbox, invertedBefore: b.invertedVsDefault, invertedAfter: d.invertedVsDefault});
       if (b.opacity !== d.opacity || b.renderOrder !== d.renderOrder) state.push(d.id);
     }
     if (geometry.length || state.length) out.changedPoses.push({name: pose.name, geometryChanged: geometry, opacityOrOrderChanged: state});
   }
   const requestedGeometry = out.changedPoses.some(p => p.name !== 'default' && p.geometryChanged.length);
-  if (out.mocBytesIdentical) out.classification = 'identical-moc';
-  else if (!out.changedPoses.some(p => p.geometryChanged.length)) out.classification = out.changedPoses.length ? 'bytes-changed-state-only' : 'bytes-changed-poses-identical';
+  if (out.mocBytesIdentical) {
+    if (out.changedPoses.length) {
+      // Same moc bytes, same Core, same poses must measure the same. Anything
+      // else is contradictory evidence, never an editing witness.
+      out.classification = 'inconsistent-evidence';
+      out.reasons.push('identical moc3 bytes produced different measurements (nondeterminism or a tampered report)');
+      return out;
+    }
+    out.classification = 'identical-moc';
+  } else if (!out.changedPoses.some(p => p.geometryChanged.length)) out.classification = out.changedPoses.length ? 'bytes-changed-state-only' : 'bytes-changed-poses-identical';
   else out.classification = 'geometry-changed';
   out.editProof = requestedGeometry;
   if (!requestedGeometry) out.reasons.push('no requested (non-default) pose changed actual geometry');
@@ -356,31 +382,47 @@ export function compareReports(current, baseline) {
 // ---- orchestration ---------------------------------------------------------------------
 
 async function realOrNull(file) { try { return await fsp.realpath(file); } catch { return null; } }
+// Filesystem identity (device + inode) so hardlinks and symlinks to a protected
+// file are caught even when their path strings differ. null where unavailable.
+async function identityOf(file) {
+  try { const st = await fsp.stat(file, {bigint: true}); return st.ino ? `${st.dev}:${st.ino}` : null; } catch { return null; }
+}
+export const LIBRARY_FILE = fileURLToPath(import.meta.url);
 
-// options: {modelPath, outPath, posesPath?, baselinePath?, requirePoseChange?, loadCore}
+// options: {modelPath, outPath, posesPath?, baselinePath?, requirePoseChange?, loadCore, protectedPaths?}
+// protectedPaths: dependency files the report must never overwrite (trusted Core,
+// CLI/loader sources); this library file is always protected.
 // loadCore(): Promise<{core, sha256}> - the trusted Core and the SHA-256 of its file.
 // Returns {report, exitCode, writeTo}. Writes nothing itself; writeTo is null
 // when the output path was not (or could not be) proven safe.
-export async function runAudit({modelPath, outPath, posesPath = null, baselinePath = null, requirePoseChange = false, loadCore}) {
-  const report = {schema: SCHEMA, status: 'failed', errors: [], model: path.basename(String(modelPath ?? '')), references: [], core: null,
+export async function runAudit({modelPath, outPath, posesPath = null, baselinePath = null, requirePoseChange = false, loadCore, protectedPaths = []}) {
+  const report = {schema: SCHEMA, status: 'failed', errors: [], model: safeLabel(path.basename(String(modelPath ?? ''))), references: [], core: null,
     coreCompatible: false, parameters: [], parts: null, structure: null, poses: [], comparison: null, limitations: LIMITATIONS};
   let writeTo = null; // set only after the output path is proven not to alias an input
   const done = code => ({report, exitCode: code, writeTo});
   try {
     if (!modelPath || !outPath) fail('E_USAGE', '--model and --out are required');
     const modelReal = await realOrNull(modelPath);
-    if (!modelReal) fail('E_MODEL_READ', 'model3.json not found', report.model);
+    if (!modelReal) fail('E_MODEL_READ', 'model3.json not found', safeLabel(report.model));
     const modelDir = path.dirname(modelReal);
     const model3 = await readJson(modelReal, LIMITS.modelJsonBytes, 'E_MODEL_JSON', report.model);
     const {resolved, errors} = await resolveReferences(modelDir, declaredReferences(model3));
 
-    // Output must not alias the model, any reference, the pose or baseline file.
+    // Output must not alias the model, any reference, the pose/baseline file or a
+    // protected dependency - by resolved path or by filesystem identity.
     const outParent = await realOrNull(path.dirname(path.resolve(outPath)));
-    if (!outParent) fail('E_OUT_PATH', 'output directory does not exist', path.basename(outPath));
+    if (!outParent) fail('E_OUT_PATH', 'output directory does not exist', safeLabel(path.basename(outPath)));
     const outReal = (await realOrNull(outPath)) ?? path.join(outParent, path.basename(outPath));
-    const inputs = [modelReal, ...resolved.map(r => r.file).filter(Boolean)];
-    for (const extra of [posesPath, baselinePath]) if (extra) { const real = await realOrNull(extra); if (real) inputs.push(real); }
-    if (inputs.includes(outReal)) fail('E_OUT_ALIAS', 'output would overwrite an input file', path.basename(outPath));
+    const guarded = [modelReal, ...resolved.map(r => r.file).filter(Boolean), posesPath, baselinePath, LIBRARY_FILE, ...protectedPaths].filter(Boolean);
+    const guardedReal = new Set(), guardedIds = new Set();
+    for (const file of guarded) {
+      const real = await realOrNull(file);
+      guardedReal.add(real ?? path.resolve(file));
+      const id = await identityOf(file);
+      if (id) guardedIds.add(id);
+    }
+    const outId = await identityOf(outReal);
+    if (guardedReal.has(outReal) || (outId && guardedIds.has(outId))) fail('E_OUT_ALIAS', 'output would overwrite an input or protected dependency', safeLabel(path.basename(outPath)));
     writeTo = outReal;
 
     for (const r of resolved) {
@@ -390,8 +432,8 @@ export async function runAudit({modelPath, outPath, posesPath = null, baselinePa
     }
     if (errors.length) { report.errors.push(...errors); return done(2); }
 
-    const poses = posesPath ? parsePoses(await readJson(posesPath, LIMITS.poseJsonBytes, 'E_POSES_READ', path.basename(posesPath))) : [];
-    const baseline = baselinePath ? await readJson(baselinePath, LIMITS.reportJsonBytes, 'E_BASELINE_READ', path.basename(baselinePath)) : null;
+    const poses = posesPath ? parsePoses(await readJson(posesPath, LIMITS.poseJsonBytes, 'E_POSES_READ', safeLabel(path.basename(posesPath)))) : [];
+    const baseline = baselinePath ? await readJson(baselinePath, LIMITS.reportJsonBytes, 'E_BASELINE_READ', safeLabel(path.basename(baselinePath))) : null;
     if (requirePoseChange && (!baseline || !poses.length)) fail('E_REQUIRE_POSE_CHANGE', '--require-pose-change needs --baseline and --poses');
 
     let loaded;
@@ -407,6 +449,10 @@ export async function runAudit({modelPath, outPath, posesPath = null, baselinePa
     if (baseline) {
       try { report.comparison = compareReports(report, baseline); }
       catch { report.comparison = {classification: 'incompatible', reasons: ['baseline report is malformed'], editProof: false, changedPoses: []}; }
+      if (report.comparison.classification === 'inconsistent-evidence') {
+        report.errors.push({code: 'E_EVIDENCE_INCONSISTENT', detail: report.comparison.reasons.join('; ')});
+        return done(2);
+      }
       if (requirePoseChange && !report.comparison.editProof) {
         report.errors.push({code: 'E_REQUIRE_POSE_CHANGE', detail: report.comparison.reasons.join('; ')});
         return done(3);

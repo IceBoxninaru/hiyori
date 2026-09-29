@@ -4,12 +4,16 @@
 // the coordinator runs the CLI with the trusted local Core and actual exports.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp, mkdir, writeFile, readFile, symlink, rm} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, symlink, link, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {runAudit, compareReports, declaredReferences, checkReference, parsePoses, inspectMoc, coreVersionText, SCHEMA} from '../src/export-audit.mjs';
+
+const WIN = process.platform === 'win32';
+// Directory links: a junction on Windows (no admin/Developer Mode needed), a symlink elsewhere.
+const linkDir = (target, at) => symlink(target, at, WIN ? 'junction' : 'dir');
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HEADER = 'FAKEMOC3';
@@ -42,7 +46,7 @@ function fakeCore({sharedState = false} = {}) {
         parts: {ids: s.parts ?? ['PartA'], opacities: Float32Array.from((s.parts ?? ['PartA']).map((_, i) => s.partOpacities?.[i] ?? 1))},
         drawables: {count: drawables.length, ids: drawables.map(d => d.id), vertexUvs: drawables.map(d => Float32Array.from(d.uvs ?? d.xy.map(v => (v + 1) / 2))),
           indices: drawables.map(d => Uint16Array.from(d.indices)), textureIndices: drawables.map(d => d.texture ?? 0), masks: drawables.map(d => d.masks ?? []),
-          opacities: Float32Array.from(drawables.map(() => 1)), renderOrders: Int32Array.from(drawables.map((_, i) => i)),
+          opacities: Float32Array.from(drawables.map(() => 1)), renderOrders: Int32Array.from(drawables.map((d, i) => d.order ?? i)),
           vertexPositions: drawables.map(d => Float32Array.from(d.xy))},
         update() {
           drawables.forEach((d, i) => {
@@ -60,15 +64,21 @@ function fakeCore({sharedState = false} = {}) {
       return model;
     },
   };
-  return {core: {Version: {csmGetVersion: () => 0x05010000, csmGetLatestMocVersion: () => 5, csmGetMocVersion: b => parse(b)?.mocVersion ?? 0}, Moc, Model}, stats};
+    // Faithful to Core 5.1.0: csmGetMocVersion(moc, mocBytes) and it reads mocBytes.byteLength.
+  const csmGetMocVersion = (moc, mocBytes) => {
+    if (!(moc instanceof Moc)) throw new TypeError('moc expected');
+    if (typeof mocBytes.byteLength !== 'number') throw new TypeError('mocBytes expected');
+    return moc.spec.mocVersion ?? 0;
+  };
+  return {core: {Version: {csmGetVersion: () => 0x05010000, csmGetLatestMocVersion: () => 5, csmGetMocVersion}, Moc, Model}, stats};
 }
 
 const baseSpec = () => ({
   mocVersion: 5,
   parameters: [{id: 'ParamAngleX', min: -30, max: 30, default: 0}, {id: 'ParamArmL', min: 0, max: 10, default: 2}, {id: 'ParamMouthOpenY', min: 0, max: 1, default: 0}],
   drawables: [
-    {id: 'ArtMeshArm', xy: [0, 0, 1, 0, 0, 1], indices: [0, 1, 2], deform: {ParamArmL: [0, 0, 0.3, 0, 0, 0]}},
-    {id: 'ArtMeshMouth', xy: [0, 0, 1, 0, 1, 1], indices: [0, 1, 2], texture: 1, masks: [0], deform: {ParamMouthOpenY: [0, 0, 0, 0, 0, 0.5]}},
+    {id: 'ArtMeshArm', order: 500, xy: [0, 0, 1, 0, 0, 1], indices: [0, 1, 2], deform: {ParamArmL: [0, 0, 0.3, 0, 0, 0]}},
+    {id: 'ArtMeshMouth', order: 600, xy: [0, 0, 1, 0, 1, 1], indices: [0, 1, 2], texture: 1, masks: [0], deform: {ParamMouthOpenY: [0, 0, 0, 0, 0, 0.5]}},
   ],
 });
 const mocBytes = spec => Buffer.from(HEADER + JSON.stringify(spec));
@@ -153,18 +163,19 @@ test('reference strings: URL, absolute, drive, UNC, traversal and malformed are 
   }
 });
 
-test('symlink escaping the model directory is rejected before reading', async () => {
+test('linked directory escaping the model directory is rejected before reading (junction on win32)', async () => {
   const fx = await fixture();
   try {
-    await writeFile(path.join(fx.dir, 'outside.png'), 'secret');
-    await symlink(path.join(fx.dir, 'outside.png'), path.join(fx.root, 'tex', 'link.png'));
+    await mkdir(path.join(fx.dir, 'outside'));
+    await writeFile(path.join(fx.dir, 'outside', 'tex.png'), 'secret');
+    await linkDir(path.join(fx.dir, 'outside'), path.join(fx.root, 'tex', 'linked'));
     const m = JSON.parse(await readFile(fx.modelPath, 'utf8'));
-    m.FileReferences.Textures = ['tex/link.png'];
+    m.FileReferences.Textures = ['tex/linked/tex.png'];
     await writeFile(fx.modelPath, JSON.stringify(m));
     const {report, exitCode} = await audit(fx);
     assert.equal(exitCode, 2);
-    assert.deepEqual(report.errors[0], {code: 'E_REF_ESCAPE', ref: 'tex/link.png', detail: 'resolves outside the model directory'});
-    assert.equal(report.references.find(r => r.ref === 'tex/link.png').sha256, null, 'escaped file never hashed');
+    assert.deepEqual(report.errors[0], {code: 'E_REF_ESCAPE', ref: 'tex/linked/tex.png', detail: 'resolves outside the model directory'});
+    assert.equal(report.references.find(r => r.ref === 'tex/linked/tex.png').sha256, null, 'escaped file never hashed');
   } finally { await fx.cleanup(); }
 });
 
@@ -221,7 +232,7 @@ test('missing Core capabilities are reported as unavailable, never as passed', (
   const r = inspectMoc(noVersion, mocBytes(baseSpec()), {textureCount: 2});
   assert.equal(r.core.consistency, 'unavailable');
   assert.equal(r.core.versionCheck, 'unavailable');
-  assert.deepEqual(r.core.unavailable, ['mocVersion', 'mocConsistency']);
+  assert.deepEqual(r.core.unavailable, ['mocConsistency', 'mocVersion']);
   assert.equal(coreVersionText(0x05010000), '5.1.0');
 });
 
@@ -364,4 +375,115 @@ test('CLI: --help, usage errors and missing Core exit without stacks or absolute
     const written = JSON.parse(await readFile(fx.outPath, 'utf8'));
     assert.equal(written.status, 'failed'); assert.equal(written.coreCompatible, false);
   } finally { await fx.cleanup(); }
+});
+
+// ---- regression tests for acceptance review of f1c2d64 --------------------------------
+test('review 1: csmGetMocVersion is called as (moc, mocBytes) after Moc creation; early failures release the Moc', () => {
+  const fake = fakeCore();
+  assert.throws(() => fake.core.Version.csmGetMocVersion(mocBytes(baseSpec()).buffer), TypeError, 'fake rejects the one-argument form like Core 5.1.0');
+  const r = inspectMoc(fake.core, mocBytes(baseSpec()), {textureCount: 2});
+  assert.equal(r.core.mocVersion, 5);
+  for (const patch of [{mocVersion: 6}, {mocVersion: 0}, {nullModel: true}]) {
+    const f = fakeCore();
+    assert.throws(() => inspectMoc(f.core, mocBytes({...baseSpec(), ...patch}), {textureCount: 2}), e => e.code.startsWith('E_'));
+    assert.equal(f.stats.mocs, 1, JSON.stringify(patch)); assert.equal(f.stats.mocsReleased, 1, `${JSON.stringify(patch)}: moc released`);
+  }
+  const throwing = fakeCore();
+  throwing.core.Version.csmGetMocVersion = () => { throw new TypeError('/private/abs/path'); };
+  assert.throws(() => inspectMoc(throwing.core, mocBytes(baseSpec()), {textureCount: 2}), e => e.code === 'E_MOC_INVALID' && !e.message.includes('/private'));
+  assert.equal(throwing.stats.mocsReleased, 1);
+});
+
+test('review 2: identical moc bytes with different measurements are inconsistent evidence, never editProof', async () => {
+  const fx = await fixture();
+  try {
+    const poses = await writePoses(fx, POSES);
+    const first = await audit(fx, {posesPath: poses});
+    const tampered = structuredClone(first.report);
+    tampered.poses[1].drawables[0].geometrySha = '0'.repeat(64);
+    const c = compareReports(first.report, tampered);
+    assert.equal(c.classification, 'inconsistent-evidence'); assert.equal(c.editProof, false);
+    const baselinePath = path.join(fx.dir, 'baseline.json');
+    await writeFile(baselinePath, JSON.stringify(tampered));
+    for (const requirePoseChange of [false, true]) {
+      const r = await audit(fx, {posesPath: poses, baselinePath, requirePoseChange});
+      assert.equal(r.exitCode, 2); assert.deepEqual(codes(r), ['E_EVIDENCE_INCONSISTENT']);
+    }
+  } finally { await fx.cleanup(); }
+});
+
+test('review 3: invalid references, keys, group and pose names are redacted from reports and CLI output', async () => {
+  const PRIVATE = 'example-private-user';
+  const badRefs = [`/Users/${PRIVATE}/tex.png`, `C:/Users/${PRIVATE}/tex.png`, `\\\\host\\${PRIVATE}\\tex.png`, `https://example.invalid/${PRIVATE}.png`, `../${PRIVATE}/tex.png`];
+  const cli = path.join(HERE, '..', 'tools', 'audit-export.mjs');
+  for (const bad of badRefs) {
+    const fx = await fixture({model3: {Version: 3, FileReferences: {Moc: 'hiyori.moc3', Textures: ['tex/texture_00.png', bad]}}});
+    try {
+      const r = await audit(fx);
+      assert.equal(r.exitCode, 2);
+      assert.equal(r.report.errors[0].ref, 'texture[1]');
+      assert.ok(!JSON.stringify(r.report).includes(PRIVATE), bad);
+      const run = spawnSync(process.execPath, [cli, '--model', fx.modelPath, '--out', fx.outPath], {encoding: 'utf8'});
+      assert.equal(run.status, 2);
+      assert.ok(!run.stderr.includes(PRIVATE) && !run.stdout.includes(PRIVATE), `CLI echoed ${bad}`);
+    } finally { await fx.cleanup(); }
+  }
+  const group = `/home/${PRIVATE}/g`;
+  assert.throws(() => declaredReferences({Version: 3, FileReferences: {Moc: 'm.moc3', Textures: ['t.png'], Motions: {[group]: {}}}}), e => !e.message.includes(PRIVATE));
+  for (const poses of [{version: 1, poses: [], [`C:/${PRIVATE}`]: 1}, {version: 1, poses: [{name: `/${PRIVATE}`, parameters: {X: 1}}]},
+    {version: 1, poses: [{name: 'a', parameters: {X: 1}, [`/${PRIVATE}`]: 1}]}, {version: 1, poses: [{name: 'a', parameters: {[`/${PRIVATE}`]: 'x'}}]}]) {
+    assert.throws(() => parsePoses(poses), e => !e.message.includes(PRIVATE) && !String(e.ref).includes(PRIVATE));
+  }
+  const fx = await fixture();
+  try {
+    const r = await audit(fx, {posesPath: await writePoses(fx, [{name: 'x', parameters: {[`/Users/${PRIVATE}`]: 1}}])});
+    assert.deepEqual(codes(r), ['E_POSE_UNKNOWN_PARAM']); assert.ok(!JSON.stringify(r.report).includes(PRIVATE));
+    const usage = spawnSync(process.execPath, [cli, `--/Users/${PRIVATE}`], {encoding: 'utf8'});
+    assert.equal(usage.status, 64); assert.ok(!usage.stderr.includes(PRIVATE));
+  } finally { await fx.cleanup(); }
+});
+
+test('review 4: output may not alias protected dependencies or inputs, including hardlinks (disposable fixtures only)', async () => {
+  const fx = await fixture();
+  try {
+    // Disposable stand-ins for the trusted Core and CLI/library sources.
+    const fakeCoreFile = path.join(fx.dir, 'fake-core.js'), fakeSource = path.join(fx.dir, 'fake-cli.mjs');
+    await writeFile(fakeCoreFile, 'core'); await writeFile(fakeSource, 'cli');
+    const protectedPaths = [fakeCoreFile, fakeSource];
+    const hardCore = path.join(fx.dir, 'hard-core.json'), hardMoc = path.join(fx.dir, 'hard-moc.json');
+    await link(fakeCoreFile, hardCore); await link(path.join(fx.root, 'hiyori.moc3'), hardMoc);
+    for (const outPath of [fakeCoreFile, fakeSource, hardCore, hardMoc]) {
+      const before = await readFile(outPath);
+      const r = await audit(fx, {outPath, protectedPaths});
+      assert.equal(r.exitCode, 2, outPath); assert.equal(r.writeTo, null); assert.deepEqual(codes(r), ['E_OUT_ALIAS']);
+      assert.deepEqual(await readFile(outPath), before);
+    }
+    // A failing audit (missing reference) must not target an input either.
+    const m = JSON.parse(await readFile(fx.modelPath, 'utf8'));
+    m.FileReferences.Physics = 'missing.physics3.json';
+    await writeFile(fx.modelPath, JSON.stringify(m));
+    const hardModel = path.join(fx.dir, 'hard-model.json');
+    await link(fx.modelPath, hardModel);
+    const failing = await audit(fx, {outPath: hardModel, protectedPaths});
+    assert.equal(failing.writeTo, null); assert.deepEqual(codes(failing), ['E_OUT_ALIAS']);
+    // An ordinary new file is still allowed.
+    const ok = await audit(fx, {outPath: path.join(fx.dir, 'new-report.json'), protectedPaths});
+    assert.equal(ok.writeTo, path.join(await (await import('node:fs/promises')).realpath(fx.dir), 'new-report.json'));
+  } finally { await fx.cleanup(); }
+});
+
+test('review 5: drawable reordering (masks remapped) and pose/parameter ordering compare as equivalent; real differences do not', async () => {
+  const twoParams = [{name: 'both', parameters: {ParamArmL: 10, ParamAngleX: 5}}, {name: 'arm-up', parameters: {ParamArmL: 10}}];
+  const base = await reportFor(baseSpec(), twoParams);
+  const reordered = baseSpec();
+  reordered.drawables = [{...reordered.drawables[1], masks: [1]}, reordered.drawables[0]];
+  const swappedPoses = [{name: 'arm-up', parameters: {ParamArmL: 10}}, {name: 'both', parameters: {ParamAngleX: 5, ParamArmL: 10}}];
+  const c = compareReports(await reportFor(reordered, swappedPoses), base);
+  assert.equal(c.classification, 'bytes-changed-poses-identical', JSON.stringify(c.reasons)); assert.equal(c.editProof, false);
+  const maskChanged = baseSpec(); maskChanged.drawables[1].masks = [];
+  assert.equal(compareReports(await reportFor(maskChanged, twoParams), base).classification, 'incompatible', 'mask difference');
+  const uvChanged = baseSpec(); uvChanged.drawables[0].uvs = [0, 0, 0.9, 0, 0, 1];
+  assert.equal(compareReports(await reportFor(uvChanged, twoParams), base).classification, 'incompatible', 'UV difference');
+  const valueChanged = [{name: 'both', parameters: {ParamArmL: 9, ParamAngleX: 5}}, twoParams[1]];
+  assert.equal(compareReports(await reportFor(baseSpec(), valueChanged), base).classification, 'incompatible', 'pose value difference');
 });

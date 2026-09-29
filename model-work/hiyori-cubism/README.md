@@ -29,6 +29,11 @@ Exit codes:
 stderr lists stable error codes (`E_REF_MISSING`, `E_MOC_UNSUPPORTED`, …) with
 model-relative names only. It never prints stacks or absolute paths.
 
+Rejected references (absolute, drive, UNC, URL, `..`) are reported only by their
+declaration slot, such as `texture[1]`; the string itself is never echoed. JSON keys,
+motion group names, pose names and parameter IDs that could carry a path are shown as
+`<redacted>`.
+
 Core: the file loaded by `../hiyori-v2/src/cubism-core-node.mjs`, i.e.
 `third-party/live2d/live2dcubismcore-5.2.min.js`. That path is ignored, and the file name
 is not version evidence: the report records the Core's SHA-256 and its actual
@@ -56,12 +61,20 @@ Pose file:
      (after `realpath`) are rejected.
    - The report lists every checked reference with its byte length and SHA-256.
    - JSON inputs have size bounds.
-2. **Output safety:** the report path must not resolve to the model3, a referenced file,
-   the poses file or the baseline. The report is never written before this is proven.
+2. **Output safety:**
+   - The report path must not be any of these, compared by resolved path and by
+     filesystem identity (device + inode), so hardlinks and symlinks are caught:
+     - the model3, a referenced file, the poses file or the baseline;
+     - the trusted Core file;
+     - the Core loader, CLI or library source.
+   - The report is never written before this is proven, including when the audit fails.
 3. **Core, through capabilities detected at runtime:**
-   - `csmGetMocVersion` against `csmGetLatestMocVersion`.
-   - `Moc.prototype.hasMocConsistency`, called the way the official Framework calls it.
+   - `Moc.prototype.hasMocConsistency(bytes)`, called before the Moc is created, the way
+     the official Framework calls it.
    - `Moc.fromArrayBuffer` and `Model.fromMoc` null checks.
+   - `csmGetMocVersion(moc, bytes)` (the Core 5.1.0 signature) against
+     `csmGetLatestMocVersion`.
+   - A Core call that throws becomes a stable code, never its message.
    - A missing capability is recorded in `core.unavailable`, never as passed.
    - Model and Moc are released in `finally`.
 4. **Structure:**
@@ -80,9 +93,14 @@ Pose file:
      default pose).
    - No raw vertex dump is stored.
 6. **Baseline comparison** (`--baseline`):
-   - `incompatible`: a different Core file or version, different pose inputs, or a
-     different drawable/topology structure.
-   - `identical-moc`: the moc bytes are identical.
+   - `incompatible`: a different Core file or version, different pose names or values,
+     or a different drawable/topology/UV/texture/mask structure.
+   - Comparison is keyed by drawable ID, pose name and parameter ID. Reordering drawables
+     (with masks remapped to the same IDs), poses or parameter maps is equivalent.
+   - `identical-moc`: the moc bytes and every measurement are identical.
+   - `inconsistent-evidence`: the moc bytes are identical but the measurements differ
+     (nondeterminism or an edited report). This exits 2 with `E_EVIDENCE_INCONSISTENT`
+     and is never `editProof`.
    - `bytes-changed-poses-identical`: the bytes changed but no sampled pose changed.
    - `bytes-changed-state-only`: only opacity or render order changed.
    - `geometry-changed`: changed drawable IDs are listed per pose.
@@ -105,7 +123,14 @@ Pose file:
 ## Tests
 
 `tests/export-audit.test.mjs` uses **synthetic** files and a fake Core that only mimics
-the inspected API surface. Passing it is not validation of any real model.
+the inspected API surface, including the two-argument `csmGetMocVersion`. Passing it is
+not validation of any real model.
+
+Link fixtures:
+- The escape test links a directory: a junction on Windows (no admin or Developer Mode
+  needed), a directory symlink elsewhere.
+- The output-alias tests use hardlinks to disposable files. They never touch the real
+  Core or sources.
 
 The coordinator runs the real checks locally:
 - the trusted Core with the actual original export;
