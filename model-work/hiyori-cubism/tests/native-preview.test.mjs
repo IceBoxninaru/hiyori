@@ -13,7 +13,7 @@ import {preparePreview, createPreviewServer, resolveRequest, parseArgs, parseCam
 import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, parsePosesV2, poseForSlot, sharedPosesAsModels, partOpacities, sdkPoseSettleSeconds, checkPosePartIds, posePartIdsFromCubismPose} from '../preview/pose-core.mjs';
 import {compareReports, runAudit} from '../src/export-audit.mjs';
 import {createLoadGuard} from '../preview/load-guard.mjs';
-import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, FIXED_UPDATE_MS, watchSdkPose, requireSdkPose} from '../preview/render-step.mjs';
+import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, FIXED_UPDATE_MS, watchSdkPose, requireSdkPose, installOrDispose} from '../preview/render-step.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WIN = process.platform === 'win32';
@@ -876,4 +876,30 @@ test('actual mode is shown: page tag set from config, CLI start line names the m
     assert.match(line, /^Native preview \(sdk-pose, read-only\): http:\/\/127\.0\.0\.1:/);
     assert.ok(!line.includes(fx.dir));
   } finally { child.kill(); await fx.cleanup(); }
+});
+
+test('a loaded model whose SDK Pose cannot settle (FadeInTime 1e308) is disposed once, with each texture once', async () => {
+  const urls = ['/m/after/r/1.png?g=6'];
+  const {PIXI, log} = fakePixi({script: async (model, settings) => {
+    emitSettings(model, settings.FileReferences.Textures);
+    model.internalModel = {coreReleased: 0};
+  }});
+  let disposals = 0;
+  const dispose = record => { disposals++; return ownedDispose(PIXI)(record); };
+  const record = await loadOwnedModel({PIXI, settings: {FileReferences: {Textures: urls}}, options: {}, urls, isCurrent: () => true, dispose});
+  assert.ok(record, 'load itself succeeded');
+  const f = fakeCore(SPEC()), state = readDeclaredState(f.core, MOC), raw = f.newModel();
+  const sdkPose = {reset() {}, updateParameters() {}, _fadeTimeSeconds: 1e308}; // finite, but 2 x fade overflows
+  await assert.rejects(installOrDispose(record, dispose, () => {
+    installDeterministicUpdate({coreModel: {}}, raw, state, () => ({name: 'd', parameters: {}}), () => {}, {sdkPose});
+  }), e => e.code === 'E_SDK_POSE_FADE');
+  await ownedDispose(PIXI)(record); // a later cleanup pass must be a no-op
+  assert.equal(disposals, 1);
+  assert.equal(record.model.destroyed, 1); assert.equal(record.model.internalModel.coreReleased, 1);
+  const destroyedTextures = log.filter(l => l.startsWith('texture:')).sort();
+  assert.deepEqual(destroyedTextures, ['texture:from:false:false:/m/after/r/1.png?g=6', 'texture:loaded:/m/after/r/1.png?g=6'], 'each texture destroyed exactly once');
+  for (const t of record.textures) assert.equal(t.destroyed, 1);
+  // success path: the record is returned and nothing is disposed
+  const ok = await loadOwnedModel({PIXI, settings: {FileReferences: {Textures: ['/m/after/r/1.png?g=7']}}, options: {}, urls: [], isCurrent: () => true, dispose});
+  assert.equal(await installOrDispose(ok, dispose, () => {}), ok); assert.equal(disposals, 1);
 });

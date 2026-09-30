@@ -5,7 +5,7 @@
 // into that slot's 2D canvas. Nothing leaves the browser; "Download PNG" saves locally.
 import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacities, partOpacityDiff, checkPosePartIds, posePartIdsFromCubismPose, topologyNotes, deriveCamera, cropToView, poseForSlot, PreviewError} from './pose-core.mjs';
 import {createLoadGuard} from './load-guard.mjs';
-import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, watchSdkPose, requireSdkPose} from './render-step.mjs';
+import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, watchSdkPose, requireSdkPose, installOrDispose} from './render-step.mjs';
 
 const SLOTS = ['before', 'after'];
 const DEFAULT_CROP = Object.freeze({x: 0.25, y: 0.18, w: 0.3, h: 0.22});
@@ -84,19 +84,20 @@ async function loadOne(core, entry, token) {
   if (!raw?.parameters?.values || !raw?.parts?.opacities) { await dispose(record); throw new PreviewError('E_RENDERER_API', 'raw Core model not reachable through pixi-live2d-display'); }
   record.raw = raw;
   try { internal.motionManager?.stopAllMotions?.(); } catch { /* ignore */ }
-  let sdkPose = null;
-  if (sdkPoseMode) {
-    try {
+  // Every post-load step that can throw runs inside the same dispose-on-failure guard.
+  await installOrDispose(record, dispose, () => {
+    let sdkPose = null;
+    if (sdkPoseMode) {
       sdkPose = requireSdkPose(internal, poseStatus);
       // Re-check against what the SDK actually loaded (it maps unknown IDs to dummy indices).
       const loadedIds = posePartIdsFromCubismPose(sdkPose);
       poseStatus.loadedPartIdsChecked = !!loadedIds;
       if (loadedIds) checkPosePartIds(loadedIds, state);
-    } catch (error) { await dispose(record); throw error; }
-  }
-  // Each slot applies its own branch of the current pose (v1 poses carry identical branches).
-  installDeterministicUpdate(internal, raw, state, () => poseForSlot(currentPose, entry.slot), applied => { record.applied = applied; },
-    {sdkPose, onPoseStep: step => { poseStatus.ran++; poseStatus.settleSeconds = step.settleSeconds; }});
+    }
+    // Each slot applies its own branch of the current pose (v1 poses carry identical branches).
+    installDeterministicUpdate(internal, raw, state, () => poseForSlot(currentPose, entry.slot), applied => { record.applied = applied; },
+      {sdkPose, onPoseStep: step => { poseStatus.ran++; poseStatus.settleSeconds = step.settleSeconds; }});
+  });
   model.visible = false;
   return record;
 }

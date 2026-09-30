@@ -137,6 +137,19 @@ export function requireSdkPose(internalModel, status) {
   return pose;
 }
 
+// Runs the post-load install steps for a successfully loaded record. Any throw (e.g. an
+// unusable SDK Pose, unknown pose part IDs, an unsettleable fade time) disposes the record
+// before rethrowing, so a loaded model and its textures are never orphaned.
+export async function installOrDispose(record, dispose, install) {
+  try {
+    install();
+    return record;
+  } catch (error) {
+    await dispose(record);
+    throw error;
+  }
+}
+
 // Per-generation resource URLs: the server ignores the query, and a reload can
 // never be served a texture cached by an earlier generation.
 export const generationUrl = (url, token) => `${url}?g=${token}`;
