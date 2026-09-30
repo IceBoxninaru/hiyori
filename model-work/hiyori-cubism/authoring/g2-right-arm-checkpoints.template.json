@@ -1,0 +1,91 @@
+{
+  "schema": "hiyori-cubism-g2-right-arm-checkpoints/draft-1",
+  "status": "DRAFT TEMPLATE - not evidence. Every null is unknown until the local coordinator records it from the Editor, an export or a real WebGL check.",
+  "procedure": "G2-right-arm.md",
+  "runtimeUse": "Do not load this file into the audit or preview tools. Copy poses out only after the export proves every parameter ID.",
+  "workingCopy": {
+    "label": null,
+    "editorVersion": null,
+    "masterCmo3Sha256": null,
+    "snapshots": [
+      {"label": null, "cmo3Sha256": null, "section": null, "notes": null}
+    ]
+  },
+  "inventory": {
+    "rightArmChain": [
+      {"role": "shoulder-shrug-rotation", "displayName": null, "id": null, "parentId": null, "pivotCanvasPx": null, "keyedParameters": null},
+      {"role": "arm-A-position", "displayName": null, "id": null, "parentId": null, "pivotCanvasPx": null, "keyedParameters": null},
+      {"role": "upper-arm-rotation", "displayName": null, "id": null, "parentId": null, "pivotCanvasPx": null, "keyedParameters": null},
+      {"role": "forearm-rotation", "displayName": null, "id": null, "parentId": null, "pivotCanvasPx": null, "keyedParameters": null},
+      {"role": "upper-arm-warp", "displayName": null, "id": null, "parentId": null, "pivotCanvasPx": null, "keyedParameters": null}
+    ],
+    "glue": [
+      {"objectA": null, "objectB": null, "weightPercent": null}
+    ],
+    "poseGroup": {"armAPartId": null, "armBPartId": null, "groupNumber": null, "armBEditorVisibilityOff": null}
+  },
+  "angleConvention": {
+    "positiveAngleScreenDirection": null,
+    "observedOn": null,
+    "method": "scratch Save-As copy, small positive angle, observe on screen (section 6.2)"
+  },
+  "parameter": {
+    "tentativeId": "ParamArmRaiseR",
+    "name": null,
+    "type": "normal",
+    "min": 0,
+    "max": 1,
+    "default": 0,
+    "createdInEditor": null,
+    "idPresentInExport": null
+  },
+  "raiseDeformer": {
+    "displayName": null,
+    "id": null,
+    "parentId": null,
+    "childId": null,
+    "insertionRationale": null,
+    "pivotCanvasPx": null,
+    "pivotSetByCtrlDragAtNeutral": null,
+    "neutralUnchangedAfterInsertion": null,
+    "keys": [
+      {"parameterValue": 0, "angleDeg": null, "note": "neutral; angle expected to remain unchanged - record the actual value"},
+      {"parameterValue": null, "angleDeg": null, "note": "shoulder-level (if a key is needed)"},
+      {"parameterValue": null, "angleDeg": null, "note": "beside-head (if a key is needed)"},
+      {"parameterValue": 1, "angleDeg": null, "note": "overhead"}
+    ]
+  },
+  "corrections": [
+    {"warpDeformerId": null, "keyedParameter": null, "keyValues": null, "reason": null}
+  ],
+  "oldKeyformsUnchanged": {
+    "sweptParameters": null,
+    "matchesG0Export": null,
+    "notes": null
+  },
+  "checkpoints": [
+    {"name": "down", "parameterValue": 0, "paramShoulderValues": [0, 1], "reviewed": null, "handRelativeToHead": null, "findings": {"glueSeamHolds": null, "hiddenJointArtExposed": null, "doubleOutline": null, "sleeveCollapse": null, "styleMismatch": null}, "notes": null},
+    {"name": "shoulder-level", "parameterValue": null, "reviewed": null, "handRelativeToHead": null, "findings": {"glueSeamHolds": null, "hiddenJointArtExposed": null, "doubleOutline": null, "sleeveCollapse": null, "styleMismatch": null}, "notes": null},
+    {"name": "beside-head", "parameterValue": null, "reviewed": null, "handRelativeToHead": null, "findings": {"glueSeamHolds": null, "hiddenJointArtExposed": null, "doubleOutline": null, "sleeveCollapse": null, "styleMismatch": null}, "notes": null},
+    {"name": "overhead", "parameterValue": 1, "paramShoulderValues": [0, 1], "reviewed": null, "handRelativeToHead": null, "findings": {"glueSeamHolds": null, "hiddenJointArtExposed": null, "doubleOutline": null, "sleeveCollapse": null, "styleMismatch": null}, "notes": null},
+    {"name": "return", "sweep": "1 to 0 in 0.1 steps", "reviewed": null, "matchesForwardSweep": null, "notes": null}
+  ],
+  "intermediateSweep": {"stepsReviewed": null, "backgrounds": ["white", "dark"], "issuesAtValues": null},
+  "persistence": {"savedClosedReopened": null, "parameterAndKeysPresentAfterReopen": null},
+  "export": {"exportVersionChoice": null, "mocVersion": null, "coreVersion": null, "auditExitCode": null, "auditComparisonClassification": null, "auditEditProof": null},
+  "webglCheck": {"rawCorePreviewReviewed": null, "sdkPoseViewReviewed": null, "sameCameraBeforeAfter": null, "rightArmsDrawnRawCore": null, "rightArmsDrawnSdkPose": null},
+  "redrawDecision": {
+    "decision": null,
+    "criteriaTriggered": [],
+    "evidence": null,
+    "criteria": ["hidden-joint-art", "double-outline", "sleeve-collapse", "style-mismatch", "old-keyforms-at-risk"]
+  },
+  "auditPosesDraft": {
+    "usableOnlyAfter": "export shows ParamArmRaiseR and each intermediate value is recorded above",
+    "version": 1,
+    "poses": [
+      {"name": "raise-down", "parameters": {"ParamArmRaiseR": 0}},
+      {"name": "raise-overhead", "parameters": {"ParamArmRaiseR": 1}}
+    ]
+  }
+}
