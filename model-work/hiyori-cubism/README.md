@@ -214,7 +214,10 @@ node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
   labels, poses and camera numbers.
 
 **Poses** (`preview/pose-core.mjs`, pure and unit-tested):
-- The server validates pose shape with the audit's `parsePoses`.
+- The server validates pose shape with the audit's `parsePoses`. It then rejects any
+  parameter ID that is not a plain SDK-style ID (letters, digits, `_`, `.`, `-`) with
+  `E_POSE_PARAM_ID` and a redacted message. `/config.json` therefore never echoes a
+  path- or URL-looking key, and legal IDs are kept unchanged.
 - The page validates IDs and ranges against each model's actual Core parameters.
   Unknown IDs and out-of-range values are errors, never clamped.
 - Declared defaults are captured from a separately instantiated raw Core model: parameter
@@ -229,8 +232,12 @@ node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
 - **One** Pixi application (one WebGL renderer, one stage) on an off-DOM canvas is used
   for both models. It is created with `autoStart:false` and `sharedTicker:false`, and
   `interaction.useSystemTicker` is disabled.
-  - Why: in a real browser, two applications left the before canvas blank. Cubism's
-    WebGL shader state is tied to one GL context.
+  - Why: in a real browser, two applications left the before canvas blank. The local
+    coordinator confirmed the cause in the actual vendor build. The Cubism shader
+    singleton holds one `gl` and its shader sets. `Live2DModel._render` rebinds it only
+    when that model's own `glContextID` changes, so rendering A, then B, then A again
+    leaves A drawing against B's context.
+  - Fix: one context for both, without forcing `updateWebGLContext` every frame.
   - Each slot is rendered alone (the other model is hidden) and copied immediately into
     that slot's visible 2D canvas. Crops and the PNG are drawn from those copies.
 - Before every intended render, `model.update(1000/60)` is called. pixi-live2d-display
@@ -251,7 +258,8 @@ node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
   above. So motion, idle, expressions, blinking, breath, physics, SDK Pose, gaze/focus
   and natural movement are all off.
 - Because SDK Pose is disabled, **both A and B arm parts can be visible**. The page says
-  so; nothing is hidden.
+  so; nothing is hidden. This overlap is a documented diagnostic limitation, not
+  something to fix by inventing or hiding geometry.
 - One camera (scale/position) is derived once from the **before** canvas info or the
   explicit `--camera`, applied identically to both models, and never re-fitted per pose.
   The same normalized shoulder crop is magnified for both.

@@ -243,8 +243,6 @@ test('missing vendor, model, poses or bad inputs fail closed with stable codes a
     await writeFile(path.join(fx.dir, 'after', 'hiyori.moc3.missing'), '');
     await rm(path.join(fx.dir, 'after', 'hiyori.moc3'));
     await assert.rejects(preparePreview(fx.opts), e => e.code === 'E_REF_MISSING' && e.message.startsWith('E_REF_MISSING: after'));
-    await writeFile(fx.opts.poses, JSON.stringify({version: 1, poses: [{name: 'default', parameters: {X: 1}}]}));
-    await assert.rejects(preparePreview(fx.opts), e => e.code === 'E_POSE_NAME' || e.code === 'E_REF_MISSING');
   } finally { await fx.cleanup(); }
   assert.throws(() => parseCamera({version: 1, zoom: -1}), e => e.code === 'E_CAMERA');
   assert.throws(() => parseCamera({version: 1, crop: {x: 0, y: 0, w: 0, h: 1}}), e => e.code === 'E_CAMERA');
@@ -409,5 +407,34 @@ test('per-generation URLs still resolve to the exact served routes', async () =>
     const prepared = await preparePreview(fx.opts);
     assert.equal(resolveRequest(prepared.routes, generationUrl('/m/before/r/1.png', 7)).status, 200);
     assert.equal(resolveRequest(prepared.routes, generationUrl('/m/before/r/9.png', 7)).status, 404);
+  } finally { await fx.cleanup(); }
+});
+
+test('pose file errors reach pose validation (isolated fixture) and malformed IDs never reach /config.json', async () => {
+  const cases = [
+    [{version: 1, poses: [{name: 'default', parameters: {ParamShoulder: 1}}]}, 'E_POSE_NAME', 'E_POSE_NAME: poses default: invalid or reserved name'],
+    [{version: 1, poses: [{name: 'p', parameters: {'/Users/example-private/x': 1}}]}, 'E_POSE_PARAM_ID', 'E_POSE_PARAM_ID: pose p: malformed parameter id (value redacted)'],
+    [{version: 1, poses: [{name: 'p', parameters: {'C:\\Users\\example-private': 1}}]}, 'E_POSE_PARAM_ID', 'E_POSE_PARAM_ID: pose p: malformed parameter id (value redacted)'],
+    [{version: 1, poses: [{name: 'p', parameters: {'https://example.invalid/x': 1}}]}, 'E_POSE_PARAM_ID', 'E_POSE_PARAM_ID: pose p: malformed parameter id (value redacted)'],
+    [{version: 1, poses: [{name: 'p', parameters: {ParamShoulder: '1'}}]}, 'E_POSE_VALUE', 'E_POSE_VALUE: poses p: non-finite value for ParamShoulder'],
+  ];
+  for (const [poses, code, message] of cases) {
+    const fx = await fixture(); // every model file present: only the pose file is wrong
+    try {
+      await writeFile(fx.opts.poses, JSON.stringify(poses));
+      const first = await preparePreview(fx.opts).then(() => null, e => e);
+      const second = await preparePreview(fx.opts).then(() => null, e => e);
+      assert.equal(first?.code, code, JSON.stringify(poses));
+      assert.equal(first.message, message, 'exact, deterministic message');
+      assert.equal(second.message, first.message);
+      assert.ok(!first.message.includes('example-private') && !first.message.includes(fx.dir));
+    } finally { await fx.cleanup(); }
+  }
+  const fx = await fixture();
+  try {
+    const legal = {ParamAngleX: -30, ParamShoulder: 1, 'Param_Arm.L-2': 0.5};
+    await writeFile(fx.opts.poses, JSON.stringify({version: 1, poses: [{name: 'legal', parameters: legal}]}));
+    const prepared = await preparePreview(fx.opts);
+    assert.deepEqual(prepared.config.poses[1].parameters, {'Param_Arm.L-2': 0.5, ParamAngleX: -30, ParamShoulder: 1}, 'legal SDK IDs preserved');
   } finally { await fx.cleanup(); }
 });

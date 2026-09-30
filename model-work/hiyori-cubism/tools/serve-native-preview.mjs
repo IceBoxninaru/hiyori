@@ -109,6 +109,11 @@ export async function preparePreview({before, after, poses, core, pixi, live2dDi
   }
   let parsedPoses;
   try { parsedPoses = parsePoses(await readJsonFile(poses ?? '', 256 << 10, 'E_POSES_READ', 'poses')); } catch (e) { throw fromAudit(e, 'poses'); }
+  // parsePoses accepts any key; /config.json must never echo a path- or URL-looking
+  // ID. Legal SDK parameter IDs (letters, digits, _ . -) pass unchanged.
+  for (const pose of parsedPoses) {
+    for (const id of Object.keys(pose.parameters)) if (safeLabel(id) !== id) fail('E_POSE_PARAM_ID', `pose ${pose.name}: malformed parameter id (value redacted)`);
+  }
   let cameraConfig = null;
   if (camera) { try { cameraConfig = parseCamera(await readJsonFile(camera, 64 << 10, 'E_CAMERA', 'camera')); } catch (e) { throw fromAudit(e, 'camera'); } }
   const config = {version: 1, mode: 'raw-core', pixiUnsafeEval: !!pixiUnsafeEval, models, poses: [{name: 'default', parameters: {}}, ...parsedPoses], camera: cameraConfig,
