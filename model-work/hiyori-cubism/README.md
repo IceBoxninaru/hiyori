@@ -180,9 +180,22 @@ node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
   All values are in normalized **before**-model canvas coordinates. Without it, the
   camera is derived once from the before model's canvas info (full body, centred), and
   the default shoulder crop is a starting guess that you adjust in the page.
-- The poses file uses the audit's shape:
-  `{"version":1,"poses":[{"name":"shrug","parameters":{"ParamShoulder":1}}]}`. A
-  `default` pose (all declared defaults) is always offered first.
+- The poses file is one of two versions. A `default` pose (all declared defaults on both models) is always
+  offered first.
+  - **v1, shared** (the audit's shape; identical values applied to both models):
+    `{"version":1,"poses":[{"name":"shrug","parameters":{"ParamShoulder":1}}]}`
+  - **v2, per model** (preview only), for comparing an original export against one that adds a parameter:
+    `{"version":2,"poses":[{"name":"raise-overhead","models":{"before":{"parameters":{}},"after":{"parameters":{"ParamArmRaiseR":1}}}}]}`
+- v2 rules:
+  - Both `before` and `after` branches are required, and each has only `parameters`.
+  - An empty map is allowed only in a v2 branch and means "all declared defaults".
+  - Unknown fields or branches, malformed IDs and non-finite values fail at startup with redacted,
+    deterministic messages.
+  - In the page, each branch is validated against its own model. An unknown ID, including a typo, or an
+    out-of-range value disables that pose.
+  - Application, read-back, the diagnostics `requestedParameters` field and the PNG label are all per slot.
+- The audit CLI accepts only v1 and keeps its strict same-input rule. Reports built from different pose
+  inputs are `incompatible` and never `editProof`. A v2 visual difference is not an audit edit witness.
 
 ## Specification (implemented)
 

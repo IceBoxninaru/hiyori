@@ -9,6 +9,7 @@ import {createReadStream, promises as fsp} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {declaredReferences, resolveReferences, parsePoses, readBounded, safeLabel, AuditError} from '../src/export-audit.mjs';
+import {parsePosesV2, sharedPosesAsModels, SLOT_NAMES, PreviewError} from '../preview/pose-core.mjs';
 
 const PREVIEW_DIR = fileURLToPath(new URL('../preview/', import.meta.url));
 export const PREVIEW_FILES = Object.freeze(['index.html', 'app.mjs', 'pose-core.mjs', 'load-guard.mjs', 'render-step.mjs', 'style.css']);
@@ -107,16 +108,29 @@ export async function preparePreview({before, after, poses, core, pixi, live2dDi
     });
     models.push(entry);
   }
-  let parsedPoses;
-  try { parsedPoses = parsePoses(await readJsonFile(poses ?? '', 256 << 10, 'E_POSES_READ', 'poses')); } catch (e) { throw fromAudit(e, 'poses'); }
-  // parsePoses accepts any key; /config.json must never echo a path- or URL-looking
-  // ID. Legal SDK parameter IDs (letters, digits, _ . -) pass unchanged.
-  for (const pose of parsedPoses) {
-    for (const id of Object.keys(pose.parameters)) if (safeLabel(id) !== id) fail('E_POSE_PARAM_ID', `pose ${pose.name}: malformed parameter id (value redacted)`);
+  // v1: the audit's shared-pose format (same values for both models).
+  // v2: preview-only explicit per-model poses (see preview/pose-core.mjs).
+  let parsedPoses, posesVersion;
+  let posesJson;
+  try { posesJson = await readJsonFile(poses ?? '', 256 << 10, 'E_POSES_READ', 'poses'); } catch (e) { throw fromAudit(e, 'poses'); }
+  if (posesJson?.version === 2) {
+    try { parsedPoses = parsePosesV2(posesJson); } catch (e) { throw e instanceof PreviewError ? new ServeError(e.code, e.detail) : e; }
+    posesVersion = 2;
+  } else {
+    let shared;
+    try { shared = parsePoses(posesJson); } catch (e) { throw fromAudit(e, 'poses'); }
+    // parsePoses accepts any key; /config.json must never echo a path- or URL-looking
+    // ID. Legal SDK parameter IDs (letters, digits, _ . -) pass unchanged.
+    for (const pose of shared) {
+      for (const id of Object.keys(pose.parameters)) if (safeLabel(id) !== id) fail('E_POSE_PARAM_ID', `pose ${pose.name}: malformed parameter id (value redacted)`);
+    }
+    parsedPoses = sharedPosesAsModels(shared);
+    posesVersion = 1;
   }
+  const defaultPose = {name: 'default', version: posesVersion, models: Object.fromEntries(SLOT_NAMES.map(slot => [slot, {parameters: {}}]))};
   let cameraConfig = null;
   if (camera) { try { cameraConfig = parseCamera(await readJsonFile(camera, 64 << 10, 'E_CAMERA', 'camera')); } catch (e) { throw fromAudit(e, 'camera'); } }
-  const config = {version: 1, mode: 'raw-core', pixiUnsafeEval: !!pixiUnsafeEval, models, poses: [{name: 'default', parameters: {}}, ...parsedPoses], camera: cameraConfig,
+  const config = {version: 1, mode: 'raw-core', pixiUnsafeEval: !!pixiUnsafeEval, models, posesVersion, poses: [defaultPose, ...parsedPoses], camera: cameraConfig,
     note: 'Raw Core mode: SDK Pose, physics, motion, expressions, blink, breath and gaze are disabled. Both A and B arm parts may be visible.'};
   const body = Buffer.from(JSON.stringify(config));
   routes.set('/config.json', {body, type: TYPES['.json']});

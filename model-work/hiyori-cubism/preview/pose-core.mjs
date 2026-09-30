@@ -49,6 +49,61 @@ export function readDeclaredState(core, mocBuffer) {
   }
 }
 
+// ---- preview pose files -------------------------------------------------------------
+// v1 (shared with the audit): {"version":1,"poses":[{"name","parameters":{id:value}}]},
+//     the same values applied to both models. Parsed by the audit's parsePoses.
+// v2 (preview only): {"version":2,"poses":[{"name","models":{"before":{"parameters":{}},
+//     "after":{"parameters":{}}}}]} - explicit values per model. Both branches are required;
+//     an empty parameters map is allowed only here and means "all declared defaults".
+export const SLOT_NAMES = Object.freeze(['before', 'after']);
+export const POSE_LIMITS = Object.freeze({poses: 12, parameters: 64});
+const POSE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const isPlainObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const sortedEntries = obj => Object.entries(obj).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+
+export function parsePosesV2(json) {
+  if (!isPlainObject(json) || json.version !== 2 || !Array.isArray(json.poses)) fail('E_POSES_SCHEMA', 'expected {"version":2,"poses":[...]}');
+  for (const key of Object.keys(json)) if (!['version', 'poses'].includes(key)) fail('E_POSES_SCHEMA', `unknown key ${safeId(key)}`);
+  if (json.poses.length > POSE_LIMITS.poses) fail('E_POSES_SCHEMA', `at most ${POSE_LIMITS.poses} poses`);
+  const names = new Set();
+  return json.poses.map((pose, index) => {
+    if (!isPlainObject(pose)) fail('E_POSES_SCHEMA', `pose[${index}] must be an object`);
+    for (const key of Object.keys(pose)) if (!['name', 'models'].includes(key)) fail('E_POSES_SCHEMA', `pose[${index}]: unknown key ${safeId(key)}`);
+    if (typeof pose.name !== 'string' || !POSE_NAME.test(pose.name) || pose.name === 'default') fail('E_POSE_NAME', `pose[${index}]: invalid or reserved name`);
+    if (names.has(pose.name)) fail('E_POSE_NAME', `pose ${pose.name}: duplicate name`);
+    names.add(pose.name);
+    if (!isPlainObject(pose.models)) fail('E_POSES_SCHEMA', `pose ${pose.name}: models must be an object`);
+    for (const key of Object.keys(pose.models)) if (!SLOT_NAMES.includes(key)) fail('E_POSES_SCHEMA', `pose ${pose.name}: unknown model branch ${safeId(key)}`);
+    const models = {};
+    for (const slot of SLOT_NAMES) {
+      const branch = pose.models[slot];
+      if (!isPlainObject(branch)) fail('E_POSES_SCHEMA', `pose ${pose.name}: missing model branch ${slot}`);
+      for (const key of Object.keys(branch)) if (key !== 'parameters') fail('E_POSES_SCHEMA', `pose ${pose.name}.${slot}: unknown key ${safeId(key)}`);
+      if (!isPlainObject(branch.parameters)) fail('E_POSES_SCHEMA', `pose ${pose.name}.${slot}: parameters must be an object`);
+      const entries = sortedEntries(branch.parameters);
+      if (entries.length > POSE_LIMITS.parameters) fail('E_POSES_SCHEMA', `pose ${pose.name}.${slot}: at most ${POSE_LIMITS.parameters} parameters`);
+      for (const [id, value] of entries) {
+        if (safeId(id) !== id) fail('E_POSE_PARAM_ID', `pose ${pose.name}.${slot}: malformed parameter id (value redacted)`);
+        if (typeof value !== 'number' || !Number.isFinite(value)) fail('E_POSE_VALUE', `pose ${pose.name}.${slot}: non-finite value for ${id}`);
+      }
+      models[slot] = {parameters: Object.fromEntries(entries)};
+    }
+    return {name: pose.name, version: 2, models};
+  });
+}
+
+// v1 poses (already parsed by the audit) as per-model poses with identical values.
+export function sharedPosesAsModels(poses) {
+  return poses.map(p => ({name: p.name, version: 1, models: Object.fromEntries(SLOT_NAMES.map(slot => [slot, {parameters: {...p.parameters}}]))}));
+}
+
+// The pose one slot renders: {name, parameters} for applyPose/validatePoseForModel.
+export function poseForSlot(pose, slot) {
+  const branch = pose?.models?.[slot];
+  if (!branch) fail('E_POSES_SCHEMA', `pose ${pose?.name ?? '?'}: missing model branch ${slot}`);
+  return {name: pose.name, parameters: branch.parameters};
+}
+
 // Validates a parsed pose ({name, parameters}) against a model's declared state.
 export function validatePoseForModel(pose, state) {
   const byId = new Map(state.parameters.map(q => [q.id, q]));

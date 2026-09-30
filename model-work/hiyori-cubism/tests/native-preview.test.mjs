@@ -10,7 +10,8 @@ import http from 'node:http';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {preparePreview, createPreviewServer, resolveRequest, parseArgs, parseCamera, PREVIEW_FILES} from '../tools/serve-native-preview.mjs';
-import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView} from '../preview/pose-core.mjs';
+import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, parsePosesV2, poseForSlot, sharedPosesAsModels} from '../preview/pose-core.mjs';
+import {compareReports, runAudit} from '../src/export-audit.mjs';
 import {createLoadGuard} from '../preview/load-guard.mjs';
 import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, FIXED_UPDATE_MS} from '../preview/render-step.mjs';
 
@@ -531,6 +532,111 @@ test('pose file errors reach pose validation (isolated fixture) and malformed ID
     const legal = {ParamAngleX: -30, ParamShoulder: 1, 'Param_Arm.L-2': 0.5};
     await writeFile(fx.opts.poses, JSON.stringify({version: 1, poses: [{name: 'legal', parameters: legal}]}));
     const prepared = await preparePreview(fx.opts);
-    assert.deepEqual(prepared.config.poses[1].parameters, {'Param_Arm.L-2': 0.5, ParamAngleX: -30, ParamShoulder: 1}, 'legal SDK IDs preserved');
+    const expected = {'Param_Arm.L-2': 0.5, ParamAngleX: -30, ParamShoulder: 1};
+    assert.equal(prepared.config.posesVersion, 1);
+    assert.deepEqual(prepared.config.poses[1].models, {before: {parameters: expected}, after: {parameters: expected}}, 'legal SDK IDs preserved; v1 values shared by both models');
   } finally { await fx.cleanup(); }
+});
+
+// ---- v2 per-model poses (preview only) ------------------------------------------------------
+const V2 = poses => ({version: 2, poses});
+const AFTER_ONLY = {name: 'raise-overhead', models: {before: {parameters: {}}, after: {parameters: {ParamArmRaiseR: 1}}}};
+const PROBE_SPEC = () => { const s = SPEC(); s.params.push({id: 'ParamArmRaiseR', min: 0, max: 1, default: 0}); return s; };
+
+test('v2 parsing: both branches required; unknown fields, IDs, non-finite values rejected with redacted deterministic messages', () => {
+  assert.deepEqual(parsePosesV2(V2([AFTER_ONLY])), [{name: 'raise-overhead', version: 2, models: {before: {parameters: {}}, after: {parameters: {ParamArmRaiseR: 1}}}}]);
+  const bad = [
+    [V2([{name: 'x', models: {after: {parameters: {}}}}]), 'E_POSES_SCHEMA', 'pose x: missing model branch before'],
+    [V2([{name: 'x', models: {before: {parameters: {}}}}]), 'E_POSES_SCHEMA', 'pose x: missing model branch after'],
+    [V2([{name: 'x', models: {before: {parameters: {}}, after: {parameters: {}}, middle: {parameters: {}}}}]), 'E_POSES_SCHEMA', 'pose x: unknown model branch middle'],
+    [V2([{name: 'x', models: {before: {parameters: {}, extra: 1}, after: {parameters: {}}}}]), 'E_POSES_SCHEMA', 'pose x.before: unknown key extra'],
+    [V2([{name: 'x', parameters: {}, models: {before: {parameters: {}}, after: {parameters: {}}}}]), 'E_POSES_SCHEMA', 'pose[0]: unknown key parameters'],
+    [{version: 2, poses: [], note: 1}, 'E_POSES_SCHEMA', 'unknown key note'],
+    [V2([{name: 'x', models: {before: {}, after: {parameters: {}}}}]), 'E_POSES_SCHEMA', 'pose x.before: parameters must be an object'],
+    [V2([{name: 'x', models: {before: {parameters: {}}, after: {parameters: {'/Users/example-private/p': 1}}}}]), 'E_POSE_PARAM_ID', 'pose x.after: malformed parameter id (value redacted)'],
+    [V2([{name: 'x', models: {before: {parameters: {}}, after: {parameters: {ParamArmRaiseR: Infinity}}}}]), 'E_POSE_VALUE', 'pose x.after: non-finite value for ParamArmRaiseR'],
+    [V2([{name: 'x', models: {before: {parameters: {}}, after: {parameters: {ParamArmRaiseR: '1'}}}}]), 'E_POSE_VALUE', 'pose x.after: non-finite value for ParamArmRaiseR'],
+    [V2([{name: 'default', models: {before: {parameters: {}}, after: {parameters: {}}}}]), 'E_POSE_NAME', 'pose[0]: invalid or reserved name'],
+    [V2([AFTER_ONLY, AFTER_ONLY]), 'E_POSE_NAME', 'pose raise-overhead: duplicate name'],
+    [V2(Array.from({length: 13}, (_, i) => ({...AFTER_ONLY, name: `p${i}`}))), 'E_POSES_SCHEMA', 'at most 12 poses'],
+  ];
+  for (const [json, code, detail] of bad) {
+    const e1 = (() => { try { parsePosesV2(json); } catch (e) { return e; } })();
+    const e2 = (() => { try { parsePosesV2(json); } catch (e) { return e; } })();
+    assert.equal(e1?.code, code, detail); assert.equal(e1.detail, detail); assert.equal(e2.message, e1.message);
+    assert.ok(!e1.message.includes('example-private'));
+  }
+});
+
+test('v2 per-slot validation: after-only new ID works; a typo or new ID on the old model still fails; v1 stays shared', () => {
+  const original = readDeclaredState(fakeCore(SPEC()).core, MOC), probe = readDeclaredState(fakeCore(PROBE_SPEC()).core, MOC);
+  const [pose] = parsePosesV2(V2([AFTER_ONLY]));
+  assert.doesNotThrow(() => validatePoseForModel(poseForSlot(pose, 'before'), original));
+  assert.doesNotThrow(() => validatePoseForModel(poseForSlot(pose, 'after'), probe));
+  const [typo] = parsePosesV2(V2([{name: 't', models: {before: {parameters: {}}, after: {parameters: {ParamArmRaizeR: 1}}}}]));
+  assert.throws(() => validatePoseForModel(poseForSlot(typo, 'after'), probe), e => e.code === 'E_POSE_UNKNOWN_PARAM' && e.detail === 't: unknown parameter ParamArmRaizeR');
+  const [wrongSide] = parsePosesV2(V2([{name: 'w', models: {before: {parameters: {ParamArmRaiseR: 1}}, after: {parameters: {}}}}]));
+  assert.throws(() => validatePoseForModel(poseForSlot(wrongSide, 'before'), original), e => e.code === 'E_POSE_UNKNOWN_PARAM');
+  const [range] = parsePosesV2(V2([{name: 'r', models: {before: {parameters: {}}, after: {parameters: {ParamArmRaiseR: 1.5}}}}]));
+  assert.throws(() => validatePoseForModel(poseForSlot(range, 'after'), probe), e => e.code === 'E_POSE_RANGE');
+  // v1 shared poses: identical branches; a v1 pose using the new ID fails on the old model (unchanged behaviour)
+  const [shared] = sharedPosesAsModels([{name: 's', parameters: {ParamArmRaiseR: 1}}]);
+  assert.deepEqual(poseForSlot(shared, 'before'), poseForSlot(shared, 'after'));
+  assert.throws(() => validatePoseForModel(poseForSlot(shared, 'before'), original), e => e.code === 'E_POSE_UNKNOWN_PARAM');
+  const [oldShared] = sharedPosesAsModels([{name: 'shrug', parameters: {ParamShoulder: 1}}]);
+  for (const [slot, state] of [['before', original], ['after', probe]]) assert.doesNotThrow(() => validatePoseForModel(poseForSlot(oldShared, slot), state));
+  assert.throws(() => poseForSlot({name: 'z', models: {before: {parameters: {}}}}, 'after'), e => e.code === 'E_POSES_SCHEMA');
+});
+
+test('v2 pose changes reset every parameter and part opacity per slot (the empty branch is the all-default baseline)', () => {
+  const f = fakeCore(PROBE_SPEC());
+  const probe = readDeclaredState(f.core, MOC), raw = f.newModel();
+  const [raise] = parsePosesV2(V2([AFTER_ONLY]));
+  const [shrug] = sharedPosesAsModels([{name: 'shrug', parameters: {ParamShoulder: 1}}]);
+  let current = shrug, applied = null;
+  const internal = {coreModel: {update() { raw.update(); }}};
+  installDeterministicUpdate(internal, raw, probe, () => poseForSlot(current, 'after'), a => { applied = a; });
+  internal.update();
+  assert.deepEqual(Array.from(raw.parameters.values), [0, 1, 0.5, 0]);
+  raw.parts.opacities[1] = 1; // e.g. a stale write
+  current = raise; internal.update();
+  assert.deepEqual(applied, {ParamArmRaiseR: 1});
+  assert.deepEqual(Array.from(raw.parameters.values), [0, 0, 0.5, 1], 'ParamShoulder from the previous pose was reset');
+  assert.deepEqual(partOpacityDiff(raw, probe), []);
+  const beforeRaw = fakeCore(SPEC()).newModel(), original = readDeclaredState(fakeCore(SPEC()).core, MOC);
+  assert.deepEqual(applyPose(beforeRaw, original, poseForSlot(raise, 'before')), {});
+  assert.deepEqual(Array.from(beforeRaw.parameters.values), [0, 0, 0.5], 'before branch: declared defaults only');
+});
+
+test('server: v2 file reaches /config.json per slot; v1 unchanged; invalid v2 fails closed', async () => {
+  const fx = await fixture();
+  try {
+    await writeFile(fx.opts.poses, JSON.stringify(V2([AFTER_ONLY])));
+    const prepared = await preparePreview(fx.opts);
+    assert.equal(prepared.config.posesVersion, 2);
+    assert.deepEqual(prepared.config.poses.map(p => [p.name, p.models.before.parameters, p.models.after.parameters]),
+      [['default', {}, {}], ['raise-overhead', {}, {ParamArmRaiseR: 1}]]);
+    await writeFile(fx.opts.poses, JSON.stringify(V2([{name: 'x', models: {after: {parameters: {}}}}])));
+    await assert.rejects(preparePreview(fx.opts), e => e.code === 'E_POSES_SCHEMA' && e.message === 'E_POSES_SCHEMA: pose x: missing model branch before');
+    await writeFile(fx.opts.poses, JSON.stringify({version: 1, poses: [{name: 'x', parameters: {}}]}));
+    await assert.rejects(preparePreview(fx.opts), e => e.code === 'E_POSES_SCHEMA', 'v1 still requires at least one parameter');
+  } finally { await fx.cleanup(); }
+});
+
+test('audit stays strict: v2 files are refused and differing pose inputs never become editProof', async () => {
+  const fx = await fixture();
+  try {
+    await writeFile(fx.opts.poses, JSON.stringify(V2([AFTER_ONLY])));
+    const r = await runAudit({modelPath: fx.opts.before, outPath: path.join(fx.dir, 'report-v2.json'), posesPath: fx.opts.poses, loadCore: async () => ({core: {}, sha256: 'x'})});
+    assert.equal(r.exitCode, 2); assert.equal(r.report.errors[0].code, 'E_POSES_SCHEMA');
+  } finally { await fx.cleanup(); }
+  const report = (poses, moc) => ({schema: 'hiyori-cubism-export-audit/1', status: 'ok', core: {sha256: 'c', version: {raw: 1}}, structure: {signature: 's'},
+    references: [{kind: 'moc', sha256: moc}], poses: poses.map(([name, parameters, geo]) => ({name, parameters, drawables: [{id: 'ArtMeshArm', geometrySha: geo, bbox: null, opacity: 1, renderOrder: 0}]}))});
+  const original = report([['default', {}, 'g0'], ['shrug', {ParamShoulder: 1}, 'g1']], 'm0');
+  const probe = report([['default', {}, 'g0'], ['raise', {ParamArmRaiseR: 1}, 'g9']], 'm1');
+  const c = compareReports(probe, original);
+  assert.equal(c.classification, 'incompatible'); assert.equal(c.editProof, false);
+  const sameInputs = compareReports(report([['default', {}, 'g0'], ['shrug', {ParamShoulder: 1}, 'g1']], 'm1'), original);
+  assert.equal(sameInputs.classification, 'bytes-changed-poses-identical', 'shared old poses unchanged: comparable, no editProof');
+  assert.equal(sameInputs.editProof, false);
 });

@@ -3,7 +3,7 @@
 // runs Core. No motion, expression, blink, breath, physics, SDK Pose or gaze.
 // One shared WebGL renderer/stage draws each model in turn; the result is copied
 // into that slot's 2D canvas. Nothing leaves the browser; "Download PNG" saves locally.
-import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, PreviewError} from './pose-core.mjs';
+import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, poseForSlot, PreviewError} from './pose-core.mjs';
 import {createLoadGuard} from './load-guard.mjs';
 import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl} from './render-step.mjs';
 
@@ -13,7 +13,7 @@ const BG = {white: 0xffffff, dark: 0x1e1f26};
 const BG_CSS = {white: '#ffffff', dark: '#1e1f26'};
 const $ = id => document.getElementById(id);
 const guard = createLoadGuard();
-let config = null, camera = null, crop = {...DEFAULT_CROP}, currentPose = {name: 'default', parameters: {}};
+let config = null, camera = null, crop = {...DEFAULT_CROP}, currentPose = {name: 'default', models: {before: {parameters: {}}, after: {parameters: {}}}};
 let slots = {}; // slot -> {model, raw, state, applied, entry, urls}
 let shared = null; // {app, view: {width, height}} - one renderer for the page lifetime
 const poseErrors = new Map();
@@ -76,7 +76,8 @@ async function loadOne(core, entry, token) {
   if (!raw?.parameters?.values || !raw?.parts?.opacities) { await dispose(record); throw new PreviewError('E_RENDERER_API', 'raw Core model not reachable through pixi-live2d-display'); }
   record.raw = raw;
   try { internal.motionManager?.stopAllMotions?.(); } catch { /* ignore */ }
-  installDeterministicUpdate(internal, raw, state, () => currentPose, applied => { record.applied = applied; });
+  // Each slot applies its own branch of the current pose (v1 poses carry identical branches).
+  installDeterministicUpdate(internal, raw, state, () => poseForSlot(currentPose, entry.slot), applied => { record.applied = applied; });
   model.visible = false;
   return record;
 }
@@ -109,7 +110,7 @@ function installLoaded(loaded, app, view) {
   slots = loaded;
   poseErrors.clear();
   for (const pose of config.poses) for (const slot of SLOTS) {
-    try { validatePoseForModel(pose, slots[slot].state); } catch (e) { poseErrors.set(pose.name, `${slot}: ${describe(e)}`); }
+    try { validatePoseForModel(poseForSlot(pose, slot), slots[slot].state); } catch (e) { poseErrors.set(pose.name, `${slot}: ${describe(e)}`); }
   }
   const select = $('pose');
   select.textContent = '';
@@ -157,11 +158,10 @@ function updateDiagnostics() {
     $(`label-${slot}`).textContent = entry.label;
     return [slot, {label: entry.label, coreVersion: state.version, mocVersion: state.mocVersion, modelCanvas: state.canvas, viewCanvasPx: shared.view,
       drawables: state.drawableIds.length, parameters: state.parameters.length, parts: state.parts.length,
-      appliedReadBack: applied, nonDefaultPartOpacities: partOpacityDiff(raw, state)}];
+      requestedParameters: poseForSlot(currentPose, slot).parameters, appliedReadBack: applied, nonDefaultPartOpacities: partOpacityDiff(raw, state)}];
   }));
-  const requested = Object.keys(currentPose.parameters);
-  const missing = SLOTS.filter(slot => requested.some(id => !(id in slots[slot].applied)));
-  $('diag').textContent = JSON.stringify({mode: config.mode, note: config.note, pose: currentPose, camera, crop,
+  const missing = SLOTS.filter(slot => Object.keys(poseForSlot(currentPose, slot).parameters).some(id => !(id in slots[slot].applied)));
+  $('diag').textContent = JSON.stringify({mode: config.mode, note: config.note, posesVersion: config.posesVersion, pose: currentPose.name, camera, crop,
     applyCheck: missing.length ? `REQUESTED VALUES NOT READ BACK for ${missing.join(', ')}` : 'requested values read back from Core for both models',
     topology: notes.length ? notes : ['same drawable IDs, parameter IDs and canvas size'],
     reminder: 'Visual differences never override an export-audit incompatibility and do not judge anatomy.', models: perSlot}, null, 1);
@@ -182,12 +182,13 @@ async function downloadPng() {
   const g = out.getContext('2d');
   g.fillStyle = BG_CSS[$('bg').value]; g.fillRect(0, 0, width, height);
   g.fillStyle = $('bg').value === 'dark' ? '#ffd166' : '#b00020'; g.font = '14px sans-serif';
-  g.fillText(`raw-core | pose ${currentPose.name} | ${JSON.stringify(currentPose.parameters)}`, pad, 18);
+  g.fillText(`raw-core | pose ${currentPose.name} (v${config.posesVersion})`, pad, 18);
   SLOTS.forEach((slot, i) => {
     const x = pad + i * (a.width + pad);
     g.drawImage($(`view-${slot}`), x, header + pad);
     g.drawImage($(`crop-${slot}`), x, header + pad * 2 + a.height);
     g.fillText(slots[slot].entry.label, x + 4, header + pad + 16);
+    g.fillText(JSON.stringify(poseForSlot(currentPose, slot).parameters), x + 4, header + pad + 34);
   });
   const blob = await new Promise(resolve => out.toBlob(resolve, 'image/png'));
   if (!blob) { $('error').textContent = 'E_DOWNLOAD: PNG encoding failed'; return; }

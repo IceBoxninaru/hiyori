@@ -185,13 +185,22 @@ Check all of these against both white and dark backgrounds.
 
 1. Save, close and reopen. Confirm the parameter, keys and angles are still present.
 2. Export moc3 at the version used for G0 (SDK 4.0), within the local Core's MocVersion ≤ 5.
-3. Run `tools/audit-export.mjs` with the **untouched G0-before (original) export** as baseline, not the +3°
-   G0-after witness. Use a poses file with
-   `ParamArmRaiseR` **only after** the export shows the ID. Expect geometry change at non-zero values, and
-   none at 0 against the baseline.
-4. Run `tools/serve-native-preview.mjs` for a same-camera before/after in raw-Core mode, which shows both A
-   and B arms.
-5. Check the visible result with SDK Pose enabled in the real app or Viewer. This is a separate local step;
+3. **Audit, old behaviour:** run `tools/audit-export.mjs` on the G2 export with `--baseline` = a report of
+   the **untouched G0-before (original) export**, not the +3° G0-after witness. Use one **v1** poses file of
+   **old parameters only** (for example `ParamShoulder`, the original arm parameters) for both reports.
+   - The baseline requires identical pose inputs.
+   - Old poses must show no geometry change.
+   - An identical-input comparison without `editProof` is the expected, passing result here.
+4. **Audit, new parameter:** run a separate audit of the G2 export alone, with a v1 poses file containing
+   `ParamArmRaiseR`, **only after** the export shows the ID. Do not pass the original as `--baseline`: it has
+   no such parameter, the audit rejects the unknown ID, and differing inputs are never `editProof`.
+   - The evidence is the G2 report's own default vs raise geometry, attributed to named drawable IDs.
+5. **Preview:** run `tools/serve-native-preview.mjs` with a **v2** poses file for a same-camera comparison:
+   the original at all defaults (`"before":{"parameters":{}}`) against the G2 export at the raise values
+   (`"after":{"parameters":{"ParamArmRaiseR":1}}`), plus v2 poses for the intermediate values.
+   - Raw-Core mode shows both A and B arm sets.
+   - Use a v1 poses file separately to compare old-parameter poses on both models.
+6. Check the visible result with SDK Pose enabled in the real app or Viewer. This is a separate local step;
    the preview is raw-Core only.
 
 ## 7. Checkpoints (all must be reviewed, both directions)
