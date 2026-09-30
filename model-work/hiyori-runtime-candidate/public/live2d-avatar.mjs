@@ -133,6 +133,8 @@ export class Live2DAvatar {
       // A rig that does not match its policy is never attached as a partial rig.
       if(policy)try{nativeArm=nativeArmRig(policy,loaded);}catch(error){loaded.destroy({children:true,texture:true,baseTexture:true});throw error;}
       this.model=loaded;this.character=character;this.elapsed=0;this.nativeArm=nativeArm;
+      // Before the first model update, which may request SDK Idle.
+      this.guardMotionStarts(loaded);
       const internal=loaded.internalModel,core=internal.coreModel,parameters=core.getModel().parameters;
       this.parameters=new Map(Array.from(parameters.ids,(id,index)=>[normalized(id),{id,index,min:parameters.minimumValues[index],max:parameters.maximumValues[index],default:parameters.defaultValues[index]}]));
       // Chitose uses PARAM_* IDs. Never ask Cubism to create nonexistent parameters.
@@ -195,7 +197,41 @@ export class Live2DAvatar {
       if(action!==this.action||model!==this.model||this.disposed)return;
       const expression=expressionNames[reaction];
       if(manager.expressionManager?.definitions.some(item=>item.Name===expression))return model.expression(expression);
-    }).catch(()=>{if(model===this.model)this.onError(new Error('Live2Dの反応を再生できません。'));});
+    }).catch(()=>{if(action===this.action&&model===this.model&&!this.disposed)this.onError(new Error('Live2Dの反応を再生できません。'));});
+  }
+
+  // pixi-live2d-display 0.4.0 shares one pending load per group/index and reads
+  // manager.state again after it. Without this guard, a continuation from before
+  // stopAllMotions() can consume a newer reservation for the same pair (or the
+  // Idle slot), start an obsolete motion and make the newer request fail. Each
+  // call runs with a facade whose state rejects a stale call before touching the
+  // real state; loads, events and property writes still use the actual manager.
+  guardMotionStarts(model){
+    const manager=model.internalModel.motionManager,state=manager.state,startMotion=manager.startMotion,reset=state.reset;
+    let resets=0;
+    state.reset=function(...args){++resets;return reset.apply(this,args);};
+    manager.startMotion=(group,index,priority)=>{
+      const ticket={resets,generation:this.generation,action:this.action};
+      // SDK Idle (priority 1) is not an avatar action; only a reset or a model change makes it stale.
+      const current=()=>ticket.resets===resets&&ticket.generation===this.generation&&model===this.model&&!this.disposed&&
+        (priority===1||ticket.action===this.action);
+      const guardedState=new Proxy(state,{get(target,key){
+        const value=Reflect.get(target,key,target);
+        if(typeof value!=='function')return value;
+        return key==='reserve'||key==='start'?(...args)=>current()&&value.apply(target,args):value.bind(target);
+      }});
+      const facade=new Proxy(manager,{
+        get(target,key){
+          if(key==='state')return guardedState;
+          // A motionStart listener may stop, release or replace this motion synchronously.
+          if(key==='_startMotion')return motion=>current()?target._startMotion(motion):undefined;
+          const value=Reflect.get(target,key,target);
+          return typeof value==='function'?value.bind(target):value;
+        },
+        set(target,key,value){return key==='playing'&&value&&!current()?true:Reflect.set(target,key,value,target);},
+      });
+      return startMotion.call(facade,group,index,priority);
+    };
   }
 
   // A frame changes independent layers. It deliberately does not call react(),
