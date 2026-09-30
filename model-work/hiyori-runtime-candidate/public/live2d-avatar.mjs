@@ -16,6 +16,45 @@ const faces={
   surprised:{smile:0,brow:.7,browAngle:0,eye:1.15,tilt:-3}
 };
 const performanceStates=new Set(['disconnected','waiting','listening','speaking','awaiting_response','considering','unknown']);
+// Opt-in ownership of the native ArmA drawing for a future accepted rig. No
+// shipped character sets character.nativeArmPolicy; without it every model
+// keeps the previous arm policy. When present it must be exactly this value.
+const nativeArmPolicy=Object.freeze({version:1,visiblePart:'PartArmA',hiddenPart:'PartArmB',
+  parameters:Object.freeze({ParamArmRaiseR:Object.freeze({min:0,default:0,max:1})})});
+const plainObject=value=>value!==null&&typeof value==='object'&&[Object.prototype,null].includes(Object.getPrototypeOf(value));
+const matchesPolicy=(value,expected)=>!plainObject(expected)?value===expected:plainObject(value)&&
+  Reflect.ownKeys(value).length===Object.keys(expected).length&&Object.keys(expected).every(key=>Object.hasOwn(value,key)&&matchesPolicy(value[key],expected[key]));
+function nativeArmPolicyOf(character){
+  if(character.nativeArmPolicy===undefined)return null;
+  if(!matchesPolicy(character.nativeArmPolicy,nativeArmPolicy))throw new Error('キャラクターの腕設定（nativeArmPolicy）の形式が正しくありません。');
+  return nativeArmPolicy;
+}
+// Checks the loaded Core declarations before the model is attached or hooked.
+// The policy parameters must be real Core parameters with the declared range.
+// The pinned SDK synthesizes undeclared pose selectors (not saved or restored),
+// so PartArm selectors may be absent; a declared one must represent 0 and 1.
+function nativeArmRig(policy,model){
+  const fail=detail=>{throw new Error(`モデルの腕リグが設定と一致しません（${detail}）。`);};
+  const core=model.internalModel.coreModel,{parameters,parts}=core.getModel();
+  const declared=id=>{
+    const index=Array.prototype.indexOf.call(parameters.ids,id);
+    return index<0?null:{min:parameters.minimumValues[index],default:parameters.defaultValues[index],max:parameters.maximumValues[index]};
+  };
+  for(const [id,expected]of Object.entries(policy.parameters)){
+    const actual=declared(id);
+    if(!actual)fail(`${id}がありません`);
+    if(actual.min!==expected.min||actual.default!==expected.default||actual.max!==expected.max)
+      fail(`${id}の最小/既定/最大が${expected.min}/${expected.default}/${expected.max}ではありません`);
+  }
+  const indexOf=id=>parts?.ids&&parts.opacities?Array.prototype.indexOf.call(parts.ids,id):-1;
+  const normal=indexOf(policy.visiblePart),raised=indexOf(policy.hiddenPart);
+  for(const [id,index]of [[policy.visiblePart,normal],[policy.hiddenPart,raised]]){
+    if(index<0||index>=parts.opacities.length)fail(`${id}パーツがありません`);
+    const selector=declared(id);
+    if(selector&&!(selector.min<=0&&selector.max>=1))fail(`${id}の切替パラメータが0と1を表せません`);
+  }
+  return {model,core,parts,normal,raised,parameterIds:Object.keys(policy.parameters)};
+}
 
 async function loadModel(PIXI,url){
   const options={autoUpdate:false,autoInteract:false,motionPreload:'ALL'};
@@ -53,7 +92,7 @@ export class Live2DAvatar {
   constructor({canvas,onError=()=>{},onStatus=()=>{},onMotionEnd=()=>{},now=()=>performance.now()}){
     this.canvas=canvas;this.onError=onError;this.onStatus=onStatus;this.onMotionEnd=onMotionEnd;
     this.now=now;this.performanceFrame=null;this.performanceGesture=null;this.performanceTurnKeys=new Set();this.performanceHeadAt=0;
-    this.performanceRelease=null;this.lastPerformancePose=null;this.armPose=null;this.armRig=null;
+    this.performanceRelease=null;this.lastPerformancePose=null;this.armPose=null;this.armRig=null;this.nativeArm=null;
     this.generation=0;this.action=0;this.active=true;this.reduced=false;this.disposed=false;
     this.reaction='calm';this.face={...faces.calm};this.audio=0;this.mouth=0;this.elapsed=0;
     this.frame=0;this.lastTime=0;this.model=null;this.app=null;this.preview=false;this.previewUntil=Infinity;
@@ -85,10 +124,15 @@ export class Live2DAvatar {
     if(generation!==this.generation||this.disposed){finish();return;}
     let loaded;
     try{
+      // A malformed policy fails before any model request is made.
+      const policy=nativeArmPolicyOf(character);
       this.initialize();
       loaded=await loadModel(globalThis.PIXI,character.modelURL);
       if(generation!==this.generation||this.disposed){loaded.destroy({children:true,texture:true,baseTexture:true});return;}
-      this.model=loaded;this.character=character;this.elapsed=0;
+      let nativeArm=null;
+      // A rig that does not match its policy is never attached as a partial rig.
+      if(policy)try{nativeArm=nativeArmRig(policy,loaded);}catch(error){loaded.destroy({children:true,texture:true,baseTexture:true});throw error;}
+      this.model=loaded;this.character=character;this.elapsed=0;this.nativeArm=nativeArm;
       const internal=loaded.internalModel,core=internal.coreModel,parameters=core.getModel().parameters;
       this.parameters=new Map(Array.from(parameters.ids,(id,index)=>[normalized(id),{id,index,min:parameters.minimumValues[index],max:parameters.maximumValues[index],default:parameters.defaultValues[index]}]));
       // Chitose uses PARAM_* IDs. Never ask Cubism to create nonexistent parameters.
@@ -196,7 +240,9 @@ export class Live2DAvatar {
         // A sparse motion owns only the current rig's authored channels. A
         // different character's curves must not suppress this rig's expression.
         const modelParameters=motionParameterIdsByModel[this.character?.id];
-        const parameters=new Set((modelParameters?.[preset.id]||[]).map(normalized));
+        // A native policy parameter is always owned, so an ordinary release
+        // cannot leave its saved value behind even before metadata lists it.
+        const parameters=new Set([...(modelParameters?.[preset.id]||[]),...(this.nativeArm?.parameterIds||[])].map(normalized));
         const gesture={action,model,parameters,until:Infinity};this.performanceGesture=gesture;
         Promise.resolve(model.motion(preset.group,preset.index,3)).then(started=>{
           if(action!==this.action||model!==this.model||this.disposed||this.performanceGesture!==gesture)return;
@@ -272,8 +318,11 @@ export class Live2DAvatar {
   // pose selector uses synthetic PartArm parameters, which saveParameters()
   // does not save or restore. Only this verified rig and generated metadata may
   // switch those drawings; performance/API frames never supply part IDs.
+  // A rig validated against nativeArmPolicy always keeps the A drawing.
   getArmRig(model=this.model){
-    if(!model||model!==this.model||this.character?.id!=='hiyori')return null;
+    if(!model||model!==this.model)return null;
+    if(this.nativeArm)return this.nativeArm.model===model?this.nativeArm:null;
+    if(this.character?.id!=='hiyori')return null;
     if(this.armRig?.model===model)return this.armRig;
     const core=model.internalModel.coreModel,parts=core.getModel?.()?.parts;
     if(!parts?.ids||!parts.opacities)return null;
@@ -294,6 +343,9 @@ export class Live2DAvatar {
   }
 
   startArmPose(preset,model){
+    // Generated metadata cannot select B on a native rig; its arm raise uses
+    // the owned parameters of the A drawing instead.
+    if(this.nativeArm)return;
     const mode=motionArmPoseByModel[this.character?.id]?.[preset.id];
     if(model!==this.model||!['normal','raised'].includes(mode))return;
     const rig=this.getArmRig(model);if(!rig)return;
@@ -302,6 +354,9 @@ export class Live2DAvatar {
   }
 
   applyArmPose(){
+    // After every SDK pose update, including App gestures, preview and legacy
+    // Tap/Idle selector curves, a native rig shows A and hides B.
+    if(this.nativeArm){const rig=this.getArmRig();if(rig)this.writeArmPose(rig,0);return;}
     const pose=this.armPose;
     if(!pose){
       // A completed legacy Tap/Idle may have left its synthetic B selector set.
@@ -321,7 +376,7 @@ export class Live2DAvatar {
 
   resetArmPose(){
     const pose=this.armPose;this.armPose=null;
-    const rig=pose?.rig||(this.performanceFrame?this.getArmRig():null);
+    const rig=pose?.rig||(this.performanceFrame||this.nativeArm?this.getArmRig():null);
     if(rig)this.writeArmPose(rig,0);
   }
 
@@ -446,7 +501,7 @@ export class Live2DAvatar {
   syncFrame(){if(this.active&&this.model&&!this.frame&&!this.disposed){this.lastTime=0;this.frame=requestAnimationFrame(this.tick);}}
   stopFrame(){if(this.frame)cancelAnimationFrame(this.frame);this.frame=0;this.lastTime=0;}
   releaseModel(){
-    this.resetArmPose();this.armRig=null;
+    this.resetArmPose();this.armRig=null;this.nativeArm=null;
     this.performanceGesture=null;this.performanceRelease=null;this.lastPerformancePose=null;
     if(!this.model)return;
     const model=this.model;this.model=null;
