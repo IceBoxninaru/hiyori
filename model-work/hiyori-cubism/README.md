@@ -250,8 +250,19 @@ node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
     generation.
   - Disposing a slot removes the model, destroys it and each of its textures, and purges
     its URLs from Pixi's texture caches.
-  - A stale load is disposed when it arrives. A rejected `Live2DModel.from` purges its
-    cached textures; its partial Cubism model is not reachable.
+  - `Live2DModel.from` is not used. The page constructs `new Live2DModel(options)`,
+    records every texture it requests on `settingsLoaded` (an `autoLoad:false` texture
+    plus a `Texture.fromURL` task per file), then calls
+    `Live2DFactory.setupLive2DModel`. A rejected or stale setup therefore still has its
+    model, any partially created Core and its textures in hand.
+  - Disposal waits for pending image work, then:
+    - with an internal model: `model.destroy({children:true})`, which releases a partial
+      Core;
+    - without one: emits `destroy`, sets `autoUpdate=false`, calls
+      `unregisterInteraction()`, and runs `Container.prototype.destroy`.
+  - Each owned texture, including `model.textures`, is destroyed exactly once. Cache
+    purging only unlinks entries that were already destroyed. Disposal is idempotent and
+    never touches another generation's URLs.
   - A failure in either slot disposes the other slot's loaded model. The raw Core model is read through
   `internalModel.coreModel.getModel()`, as the current app does.
 - Its `internalModel.update` is replaced by the deterministic reset/apply/Core update

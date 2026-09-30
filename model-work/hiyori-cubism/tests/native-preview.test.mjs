@@ -12,7 +12,7 @@ import {fileURLToPath} from 'node:url';
 import {preparePreview, createPreviewServer, resolveRequest, parseArgs, parseCamera, PREVIEW_FILES} from '../tools/serve-native-preview.mjs';
 import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView} from '../preview/pose-core.mjs';
 import {createLoadGuard} from '../preview/load-guard.mjs';
-import {renderSlotOnce, disposeRecord, loadSlotsOwned, purgeTextureCache, generationUrl, FIXED_UPDATE_MS} from '../preview/render-step.mjs';
+import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, FIXED_UPDATE_MS} from '../preview/render-step.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WIN = process.platform === 'win32';
@@ -352,22 +352,118 @@ test('shared renderer: each slot renders alone and is copied before the next slo
   assert.throws(() => renderSlotOnce({renderer, stage, records: {}, slot: 'before', copy: () => {}}), e => e.code === 'E_RENDER_STATE');
 });
 
-test('disposeRecord destroys the model and its textures, purges its URLs, and is idempotent', () => {
+test('disposeRecord destroys model and textures once, skips already-destroyed cache entries, and is idempotent', async () => {
   const destroyed = [];
-  const texture = name => ({destroy: base => destroyed.push(`${name}:${base}`)});
+  const texture = name => ({name, destroy: base => destroyed.push(`${name}:${base}`)});
   const parent = {removed: 0, removeChild() { this.removed++; }};
-  const model = {parent, textures: [texture('t0'), texture('t1')], destroy: opts => destroyed.push(`model:${opts.texture && opts.baseTexture}`)};
+  const t0 = texture('t0'), t1 = texture('t1');
+  const model = {parent, internalModel: {}, textures: [t0, t1], destroy: opts => destroyed.push(`model:${opts.children}`)};
   const purged = [];
-  const record = {model, urls: ['/m/before/r/0.moc3?g=2', '/m/before/r/1.png?g=2']};
-  disposeRecord(record, urls => purged.push(...urls));
-  disposeRecord(record, urls => purged.push(...urls));
+  const record = {model, textures: new Set([t0]), textureTasks: [], urls: ['/m/before/r/0.moc3?g=2', '/m/before/r/1.png?g=2']};
+  const cache = {'/m/before/r/1.png?g=2': t1, 'http://127.0.0.1:5190/m/before/r/1.png?g=2': texture('abs'), '/m/after/r/1.png?g=2': texture('keep')};
+  const purge = (urls, skip) => { purged.push(...urls); purgeTextureCache([cache, null], urls, 'http://127.0.0.1:5190/', skip); };
+  await Promise.all([disposeRecord(record, {purge}), disposeRecord(record, {purge})]);
   assert.equal(parent.removed, 1);
-  assert.deepEqual(destroyed, ['model:true', 't0:true', 't1:true']);
+  assert.deepEqual(destroyed.sort(), ['abs:true', 'model:true', 't0:true', 't1:true'], 'each destroyed exactly once (t1 was both owned and cached)');
+  assert.deepEqual(model.textures, [], 'wrapper will not destroy the textures again');
   assert.deepEqual(purged, record.urls);
-  const cache = {'/m/before/r/1.png?g=2': texture('cached'), 'http://127.0.0.1:5190/m/before/r/1.png?g=2': texture('abs'), '/m/after/r/1.png?g=2': texture('keep')};
-  assert.equal(purgeTextureCache([cache, null], ['/m/before/r/1.png?g=2'], 'http://127.0.0.1:5190/'), 2);
   assert.deepEqual(Object.keys(cache), ['/m/after/r/1.png?g=2'], 'other slot texture untouched');
   assert.equal(generationUrl('/m/before/r/1.png', 3), '/m/before/r/1.png?g=3');
+});
+
+// ---- explicit ownership of Live2DModel setup (fake of the 0.4.0 wrapper; not real Pixi) ----
+function fakePixi({script}) {
+  const log = [];
+  const count = key => { log.push(key); };
+  class FakeTexture {
+    constructor(url, kind) { this.url = url; this.kind = kind; this.destroyed = 0; }
+    destroy() { this.destroyed++; count(`texture:${this.kind}:${this.url}`); }
+  }
+  class Live2DModel {
+    constructor(options) { this.options = options; this.listeners = {}; this.textures = []; this.internalModel = null; this.autoUpdate = true; this.unregistered = 0; this.containerDestroyed = 0; this.destroyed = 0; }
+    once(event, fn) { this.listeners[event] = fn; }
+    emit(event, arg) { const fn = this.listeners[event]; delete this.listeners[event]; fn?.(arg); if (event === 'destroy') count('model:destroy-event'); }
+    unregisterInteraction() { this.unregistered++; }
+    destroy() { this.destroyed++; if (this.internalModel) { this.internalModel.coreReleased++; count('core:released'); } count('model:destroy'); }
+  }
+  const PIXI = {
+    live2d: {Live2DModel, Live2DFactory: {setupLive2DModel: (model, settings, options) => script(model, settings, options, {FakeTexture})}},
+    Texture: {from: (url, opts, strict) => new FakeTexture(url, `from:${opts.resourceOptions.autoLoad}:${strict}`),
+      fromURL: url => PIXI.fetchImage(url).then(() => new FakeTexture(url, 'loaded'))},
+    fetchImage: () => Promise.resolve(),
+    Container: {prototype: {destroy() { this.containerDestroyed++; count('container:destroy'); }}},
+  };
+  return {PIXI, log};
+}
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const emitSettings = (model, urls) => model.emit('settingsLoaded', {textures: urls, resolveURL: f => f});
+const ownedDispose = PIXI => record => disposeRecord(record, {containerDestroy: PIXI.Container.prototype.destroy, purge: () => {}});
+
+test('delayed second-texture failure after partial Core creation: all owned resources disposed once, other generation untouched', async () => {
+  const urlsG1 = ['/m/before/r/1.png?g=1', '/m/before/r/2.png?g=1'];
+  const {PIXI, log} = fakePixi({script: async (model, settings) => {
+    emitSettings(model, settings.FileReferences.Textures);
+    model.internalModel = {coreReleased: 0}; // Core/moc created before textures finish
+    await delay(15);
+    throw new Error('texture 2 failed');
+  }});
+  PIXI.fetchImage = url => url.endsWith('2.png?g=1') ? delay(10).then(() => { throw new Error('404'); }) : delay(5);
+  const other = {model: null, textures: new Set([{destroyed: 0, destroy() { this.destroyed++; }}]), textureTasks: [], urls: ['/m/before/r/1.png?g=2']};
+  let captured = null;
+  const dispose = record => { captured = record; return ownedDispose(PIXI)(record); };
+  await assert.rejects(loadOwnedModel({PIXI, settings: {FileReferences: {Textures: urlsG1}}, options: {}, urls: urlsG1, isCurrent: () => true, dispose}), /texture 2 failed/);
+  assert.equal(captured.model.internalModel.coreReleased, 1, 'partial Core released once');
+  assert.equal(captured.model.destroyed, 1);
+  // owned: two autoLoad:false textures + one successfully loaded image; the failed image created none
+  const destroyedTextures = log.filter(l => l.startsWith('texture:')).sort();
+  assert.deepEqual(destroyedTextures, ['texture:from:false:false:/m/before/r/1.png?g=1', 'texture:from:false:false:/m/before/r/2.png?g=1', 'texture:loaded:/m/before/r/1.png?g=1']);
+  for (const t of captured.textures) assert.equal(t.destroyed, 1);
+  assert.equal([...other.textures][0].destroyed, 0, 'other generation untouched');
+  await ownedDispose(PIXI)(captured);
+  assert.equal(log.filter(l => l === 'core:released').length, 1, 'second dispose is a no-op');
+});
+
+test('setup rejecting before any internal model: emit destroy, stop updates, unregister interaction, container destroy', async () => {
+  const {PIXI, log} = fakePixi({script: async () => { throw new Error('moc fetch failed'); }});
+  let captured = null;
+  const dispose = record => { captured = record; return ownedDispose(PIXI)(record); };
+  await assert.rejects(loadOwnedModel({PIXI, settings: {}, options: {}, urls: [], isCurrent: () => true, dispose}), /moc fetch failed/);
+  const m = captured.model;
+  assert.equal(m.destroyed, 0); assert.equal(m.containerDestroyed, 1); assert.equal(m.unregistered, 1); assert.equal(m.autoUpdate, false);
+  assert.deepEqual(log, ['model:destroy-event', 'container:destroy']);
+});
+
+test('stale generation with a late image completion: disposed after setup, late texture destroyed exactly once', async () => {
+  const urls = ['/m/after/r/1.png?g=4'];
+  let releaseImage;
+  const imageGate = new Promise(resolve => { releaseImage = resolve; });
+  const {PIXI, log} = fakePixi({script: async (model, settings) => {
+    emitSettings(model, settings.FileReferences.Textures);
+    model.internalModel = {coreReleased: 0};
+    model.textures = [new (class { destroy() { log.push('texture:wrapper'); } })()];
+  }});
+  PIXI.fetchImage = () => imageGate;
+  const guard = createLoadGuard();
+  const token = guard.begin();
+  let captured = null;
+  const dispose = record => { captured = record; return ownedDispose(PIXI)(record); };
+  const pending = loadOwnedModel({PIXI, settings: {FileReferences: {Textures: urls}}, options: {}, urls, isCurrent: () => guard.isCurrent(token), dispose});
+  guard.begin(); // a reload supersedes this generation
+  await delay(5);
+  assert.equal(log.length, 0, 'disposal waits for the pending image work');
+  releaseImage();
+  assert.equal(await pending, null);
+  assert.equal(captured.model.internalModel.coreReleased, 1);
+  assert.deepEqual(log.filter(l => l.startsWith('texture:')).sort(), ['texture:from:false:false:/m/after/r/1.png?g=4', 'texture:loaded:/m/after/r/1.png?g=4', 'texture:wrapper']);
+});
+
+test('successful current setup returns the owned record without disposing anything', async () => {
+  const urls = ['/m/before/r/1.png?g=5'];
+  const {PIXI, log} = fakePixi({script: async (model, settings) => { emitSettings(model, settings.FileReferences.Textures); model.internalModel = {coreReleased: 0}; }});
+  const record = await loadOwnedModel({PIXI, settings: {FileReferences: {Textures: urls}}, options: {autoUpdate: false}, urls, isCurrent: () => true, dispose: ownedDispose(PIXI)});
+  await Promise.allSettled(record.textureTasks);
+  assert.equal(record.model.options.autoUpdate, false);
+  assert.equal(record.textures.size, 2); assert.deepEqual(log, []);
 });
 
 test('owned two-slot loads: success, rejected second slot, stale mid-load and reload invalidation', async () => {

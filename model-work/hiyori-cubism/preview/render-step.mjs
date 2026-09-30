@@ -19,8 +19,9 @@ export function renderSlotOnce({renderer, stage, records, slot, copy}) {
   copy(renderer.view); // copy immediately after this render, before the next slot draws
 }
 
-// Removes cached textures for exact URLs (and their absolute forms) and destroys them.
-export function purgeTextureCache(caches, urls, base = null) {
+// Removes cached textures for exact URLs (and their absolute forms). Entries in
+// `alreadyDestroyed` are only unlinked from the cache, never destroyed twice.
+export function purgeTextureCache(caches, urls, base = null, alreadyDestroyed = new Set()) {
   const keys = new Set();
   for (const url of urls) {
     keys.add(url);
@@ -33,24 +34,62 @@ export function purgeTextureCache(caches, urls, base = null) {
       const entry = cache[key];
       if (!entry) continue;
       delete cache[key];
-      try { entry.destroy?.(true); } catch { /* ignore */ }
+      if (!alreadyDestroyed.has(entry)) { try { entry.destroy?.(true); } catch { /* ignore */ } alreadyDestroyed.add(entry); }
       purged++;
     }
   }
   return purged;
 }
 
-// Destroys one slot's model and every texture it owns, then purges its URLs.
-// Idempotent. purge(urls) is injected (Pixi caches in the browser, fakes in tests).
-export function disposeRecord(record, purge = () => {}) {
+// Loads a model with EXPLICIT instance ownership instead of Live2DModel.from, so a
+// rejected setup cannot hide a partially created model/Core or its textures.
+// Returns {model, textures, textureTasks, urls} or null when superseded; on
+// rejection everything created so far is disposed and the error is rethrown.
+export async function loadOwnedModel({PIXI, settings, options, urls, isCurrent, dispose}) {
+  const model = new PIXI.live2d.Live2DModel(options);
+  const record = {model, textures: new Set(), textureTasks: [], urls, disposed: false};
+  model.once('settingsLoaded', loaded => {
+    for (const file of loaded.textures) {
+      const url = loaded.resolveURL(file);
+      record.textures.add(PIXI.Texture.from(url, {resourceOptions: {autoLoad: false}}, false));
+      record.textureTasks.push(PIXI.Texture.fromURL(url).then(texture => { record.textures.add(texture); }, () => {}));
+    }
+  });
+  try {
+    await PIXI.live2d.Live2DFactory.setupLive2DModel(model, settings, options);
+  } catch (error) {
+    await dispose(record);
+    throw error;
+  }
+  if (!isCurrent()) { await dispose(record); return null; }
+  return record;
+}
+
+// Destroys one slot's model (including a partially created Core) and every texture it
+// owns, once, after pending image work settles; then purges its URLs. Idempotent.
+// containerDestroy: PIXI.Container.prototype.destroy, used when no internalModel exists.
+export async function disposeRecord(record, {purge = () => {}, containerDestroy = null} = {}) {
   if (!record || record.disposed) return;
   record.disposed = true;
+  await Promise.allSettled(record.textureTasks ?? []);
   const model = record.model;
-  const textures = [...(model?.textures ?? [])];
-  try { model?.parent?.removeChild?.(model); } catch { /* ignore */ }
-  try { model?.destroy?.({children: true, texture: true, baseTexture: true}); } catch { /* ignore */ }
+  const textures = new Set(record.textures ?? []);
+  for (const texture of model?.textures ?? []) textures.add(texture);
+  if (model) {
+    try { model.parent?.removeChild?.(model); } catch { /* ignore */ }
+    try { model.textures = []; } catch { /* ignore */ } // textures are destroyed below, exactly once
+    try {
+      if (model.internalModel) model.destroy({children: true});
+      else {
+        model.emit?.('destroy');
+        model.autoUpdate = false;
+        model.unregisterInteraction?.();
+        containerDestroy?.call(model, {children: true});
+      }
+    } catch { /* ignore */ }
+  }
   for (const texture of textures) { try { texture.destroy?.(true); } catch { /* ignore */ } }
-  try { purge(record.urls ?? []); } catch { /* ignore */ }
+  try { purge(record.urls ?? [], textures); } catch { /* ignore */ }
 }
 
 // Loads every slot in order and owns the partial result: on a stale generation,
@@ -70,7 +109,7 @@ export async function loadSlotsOwned(entries, {guard, token, loadOne, dispose}) 
     committed = true;
     return loaded;
   } finally {
-    if (!committed) for (const record of Object.values(loaded)) dispose(record);
+    if (!committed) await Promise.all(Object.values(loaded).map(record => dispose(record)));
   }
 }
 

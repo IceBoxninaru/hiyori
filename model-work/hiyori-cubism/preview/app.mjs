@@ -5,7 +5,7 @@
 // into that slot's 2D canvas. Nothing leaves the browser; "Download PNG" saves locally.
 import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, PreviewError} from './pose-core.mjs';
 import {createLoadGuard} from './load-guard.mjs';
-import {renderSlotOnce, disposeRecord, loadSlotsOwned, purgeTextureCache, generationUrl} from './render-step.mjs';
+import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl} from './render-step.mjs';
 
 const SLOTS = ['before', 'after'];
 const DEFAULT_CROP = Object.freeze({x: 0.25, y: 0.18, w: 0.3, h: 0.22});
@@ -55,30 +55,25 @@ function sharedRenderer() {
   return shared;
 }
 
-const purge = urls => purgeTextureCache([PIXI.utils?.TextureCache, PIXI.utils?.BaseTextureCache], urls, location.href);
-const dispose = record => disposeRecord(record, purge);
+const purge = (urls, destroyed) => purgeTextureCache([PIXI.utils?.TextureCache, PIXI.utils?.BaseTextureCache], urls, location.href, destroyed);
+const dispose = record => disposeRecord(record, {purge, containerDestroy: PIXI.Container.prototype.destroy});
 
 // Loads one slot with explicit ownership of its model and per-generation texture URLs.
 async function loadOne(core, entry, token) {
   const moc = generationUrl(entry.moc, token), textures = entry.textures.map(t => generationUrl(t, token));
   const state = readDeclaredState(core, await fetchChecked(moc, 'binary'));
   if (!guard.isCurrent(token)) return null;
-  const record = {model: null, raw: null, state, applied: {}, entry, urls: [moc, ...textures]};
   // Settings object with Moc + Textures only: no physics, pose, motion or expression files are requested.
   const settings = {url: `/m/${entry.slot}/model3.json`, Version: 3, FileReferences: {Moc: moc, Textures: textures}};
-  let model;
-  try {
-    model = await guard.settle(token, PIXI.live2d.Live2DModel.from(settings, {autoInteract: false, autoUpdate: false, motionPreload: 'none'}),
-      stale => dispose({...record, model: stale}));
-  } catch (error) {
-    purge(record.urls); // a rejected load's partial model is unreachable; its cached textures are not
-    throw error;
-  }
-  if (!model) return null; // stale: already disposed by the settle callback
-  record.model = model;
+  // Explicit instance ownership: a rejected or stale setup is fully disposed, partial Core included.
+  const owned = await loadOwnedModel({PIXI, settings, options: {autoInteract: false, autoUpdate: false, motionPreload: 'none'},
+    urls: [moc, ...textures], isCurrent: () => guard.isCurrent(token), dispose});
+  if (!owned) return null;
+  const record = Object.assign(owned, {raw: null, state, applied: {}, entry});
+  const model = record.model;
   const internal = model.internalModel, coreModel = internal?.coreModel;
   const raw = coreModel?.getModel?.() ?? coreModel?._model;
-  if (!raw?.parameters?.values || !raw?.parts?.opacities) { dispose(record); throw new PreviewError('E_RENDERER_API', 'raw Core model not reachable through pixi-live2d-display'); }
+  if (!raw?.parameters?.values || !raw?.parts?.opacities) { await dispose(record); throw new PreviewError('E_RENDERER_API', 'raw Core model not reachable through pixi-live2d-display'); }
   record.raw = raw;
   try { internal.motionManager?.stopAllMotions?.(); } catch { /* ignore */ }
   installDeterministicUpdate(internal, raw, state, () => currentPose, applied => { record.applied = applied; });
@@ -88,14 +83,19 @@ async function loadOne(core, entry, token) {
 
 async function loadAll() {
   const token = guard.begin();
-  for (const slot of SLOTS) dispose(slots[slot]);
+  const previous = slots;
   slots = {}; camera = null;
+  await Promise.all(SLOTS.map(slot => dispose(previous[slot])));
   $('error').textContent = ''; $('diag').textContent = 'loading…';
   const core = await waitForVendors();
   const {app, view} = sharedRenderer();
   const loaded = await loadSlotsOwned(config.models, {guard, token, loadOne: (entry, t) => loadOne(core, entry, t), dispose});
   if (!loaded) return; // superseded by a newer load; everything from this one is disposed
-  try { installLoaded(loaded, app, view); } catch (error) { for (const record of Object.values(loaded)) dispose(record); slots = {}; camera = null; throw error; }
+  try { installLoaded(loaded, app, view); } catch (error) {
+    slots = {}; camera = null;
+    await Promise.all(Object.values(loaded).map(record => dispose(record)));
+    throw error;
+  }
 }
 
 function installLoaded(loaded, app, view) {
