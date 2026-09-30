@@ -3,9 +3,9 @@
 // runs Core. No motion, expression, blink, breath, physics, SDK Pose or gaze.
 // One shared WebGL renderer/stage draws each model in turn; the result is copied
 // into that slot's 2D canvas. Nothing leaves the browser; "Download PNG" saves locally.
-import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, poseForSlot, PreviewError} from './pose-core.mjs';
+import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacities, partOpacityDiff, topologyNotes, deriveCamera, cropToView, poseForSlot, PreviewError} from './pose-core.mjs';
 import {createLoadGuard} from './load-guard.mjs';
-import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl} from './render-step.mjs';
+import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, watchSdkPose, requireSdkPose} from './render-step.mjs';
 
 const SLOTS = ['before', 'after'];
 const DEFAULT_CROP = Object.freeze({x: 0.25, y: 0.18, w: 0.3, h: 0.22});
@@ -63,21 +63,32 @@ async function loadOne(core, entry, token) {
   const moc = generationUrl(entry.moc, token), textures = entry.textures.map(t => generationUrl(t, token));
   const state = readDeclaredState(core, await fetchChecked(moc, 'binary'));
   if (!guard.isCurrent(token)) return null;
-  // Settings object with Moc + Textures only: no physics, pose, motion or expression files are requested.
-  const settings = {url: `/m/${entry.slot}/model3.json`, Version: 3, FileReferences: {Moc: moc, Textures: textures}};
+  // Settings with Moc + Textures (+ the model3's own Pose in sdk-pose mode) only: no physics,
+  // motion or expression files are requested.
+  const sdkPoseMode = config.mode === 'sdk-pose';
+  const pose = sdkPoseMode ? generationUrl(entry.pose, token) : null;
+  const refs = {Moc: moc, Textures: textures, ...(sdkPoseMode ? {Pose: pose} : {})};
+  const settings = {url: `/m/${entry.slot}/model3.json`, Version: 3, FileReferences: refs};
+  let poseStatus = null;
   // Explicit instance ownership: a rejected or stale setup is fully disposed, partial Core included.
   const owned = await loadOwnedModel({PIXI, settings, options: {autoInteract: false, autoUpdate: false, motionPreload: 'none'},
-    urls: [moc, ...textures], isCurrent: () => guard.isCurrent(token), dispose});
+    urls: [moc, ...textures, ...(pose ? [pose] : [])], isCurrent: () => guard.isCurrent(token), dispose,
+    onCreate: model => { poseStatus = watchSdkPose(model, sdkPoseMode); }});
   if (!owned) return null;
-  const record = Object.assign(owned, {raw: null, state, applied: {}, entry});
+  const record = Object.assign(owned, {raw: null, state, applied: {}, entry, poseStatus});
   const model = record.model;
   const internal = model.internalModel, coreModel = internal?.coreModel;
   const raw = coreModel?.getModel?.() ?? coreModel?._model;
   if (!raw?.parameters?.values || !raw?.parts?.opacities) { await dispose(record); throw new PreviewError('E_RENDERER_API', 'raw Core model not reachable through pixi-live2d-display'); }
   record.raw = raw;
   try { internal.motionManager?.stopAllMotions?.(); } catch { /* ignore */ }
+  let sdkPose = null;
+  if (sdkPoseMode) {
+    try { sdkPose = requireSdkPose(internal, poseStatus); } catch (error) { await dispose(record); throw error; }
+  }
   // Each slot applies its own branch of the current pose (v1 poses carry identical branches).
-  installDeterministicUpdate(internal, raw, state, () => poseForSlot(currentPose, entry.slot), applied => { record.applied = applied; });
+  installDeterministicUpdate(internal, raw, state, () => poseForSlot(currentPose, entry.slot), applied => { record.applied = applied; },
+    {sdkPose, onPoseStep: () => { poseStatus.ran++; }});
   model.visible = false;
   return record;
 }
@@ -154,11 +165,13 @@ function renderAll() {
 function updateDiagnostics() {
   const notes = topologyNotes(slots.before.state, slots.after.state);
   const perSlot = Object.fromEntries(SLOTS.map(slot => {
-    const {state, raw, applied, entry} = slots[slot];
+    const {state, raw, applied, entry, poseStatus} = slots[slot];
     $(`label-${slot}`).textContent = entry.label;
     return [slot, {label: entry.label, coreVersion: state.version, mocVersion: state.mocVersion, modelCanvas: state.canvas, viewCanvasPx: shared.view,
       drawables: state.drawableIds.length, parameters: state.parameters.length, parts: state.parts.length,
-      requestedParameters: poseForSlot(currentPose, slot).parameters, appliedReadBack: applied, nonDefaultPartOpacities: partOpacityDiff(raw, state)}];
+      sdkPose: poseStatus?.requested ? {loaded: poseStatus.loaded, loadError: poseStatus.error, evaluatedRenders: poseStatus.ran} : 'not used (raw-core)',
+      requestedParameters: poseForSlot(currentPose, slot).parameters, appliedReadBack: applied,
+      nonDefaultPartOpacities: partOpacityDiff(raw, state), partOpacities: partOpacities(raw, state)}];
   }));
   const missing = SLOTS.filter(slot => Object.keys(poseForSlot(currentPose, slot).parameters).some(id => !(id in slots[slot].applied)));
   $('diag').textContent = JSON.stringify({mode: config.mode, note: config.note, posesVersion: config.posesVersion, pose: currentPose.name, camera, crop,
@@ -182,7 +195,8 @@ async function downloadPng() {
   const g = out.getContext('2d');
   g.fillStyle = BG_CSS[$('bg').value]; g.fillRect(0, 0, width, height);
   g.fillStyle = $('bg').value === 'dark' ? '#ffd166' : '#b00020'; g.font = '14px sans-serif';
-  g.fillText(`raw-core | pose ${currentPose.name} (v${config.posesVersion})`, pad, 18);
+  const poseRun = config.mode === 'sdk-pose' ? SLOTS.map(slot => `${slot}:${slots[slot].poseStatus?.loaded && slots[slot].poseStatus.ran ? 'pose evaluated' : 'POSE NOT EVALUATED'}`).join(' ') : 'SDK Pose off';
+  g.fillText(`${config.mode} | ${poseRun} | pose ${currentPose.name} (v${config.posesVersion})`, pad, 18);
   SLOTS.forEach((slot, i) => {
     const x = pad + i * (a.width + pad);
     g.drawImage($(`view-${slot}`), x, header + pad);

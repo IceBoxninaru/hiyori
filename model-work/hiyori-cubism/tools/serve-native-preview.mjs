@@ -66,7 +66,29 @@ export function parseCamera(json) {
 
 // Resolves everything once. Returns {routes: Map(url -> {file, real, base, type}), config}.
 // Every failure is a ServeError with a stable code and no absolute path.
-export async function preparePreview({before, after, poses, core, pixi, live2dDisplay, pixiUnsafeEval = null, camera = null}) {
+export const MODES = Object.freeze(['raw-core', 'sdk-pose']);
+const NOTES = {
+  'raw-core': 'Raw Core mode: SDK Pose, physics, motion, expressions, blink, breath and gaze are disabled. Both A and B arm parts may be visible.',
+  'sdk-pose': 'SDK Pose mode: the model3 pose3.json is loaded and evaluated by pixi-live2d-display (CubismPose), settled to a still image. Physics, motion, expressions, blink, breath and gaze stay disabled.',
+};
+
+// Minimal pose3.json shape check (CubismSpecs): {"FadeInTime"?, "Groups":[[{"Id","Link"?}]]}.
+export function checkPose3(json, slot) {
+  const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
+  if (!isObj(json) || !Array.isArray(json.Groups) || !json.Groups.length) fail('E_POSE_FILE_SCHEMA', `${slot}: pose3 needs a non-empty Groups array`);
+  if ('FadeInTime' in json && (typeof json.FadeInTime !== 'number' || !Number.isFinite(json.FadeInTime))) fail('E_POSE_FILE_SCHEMA', `${slot}: FadeInTime must be a finite number`);
+  for (const group of json.Groups) {
+    if (!Array.isArray(group) || !group.length) fail('E_POSE_FILE_SCHEMA', `${slot}: each group must be a non-empty array`);
+    for (const part of group) {
+      if (!isObj(part) || typeof part.Id !== 'string' || !part.Id) fail('E_POSE_FILE_SCHEMA', `${slot}: each group entry needs a string Id`);
+      if ('Link' in part && !(Array.isArray(part.Link) && part.Link.every(id => typeof id === 'string'))) fail('E_POSE_FILE_SCHEMA', `${slot}: Link must be an array of part IDs`);
+    }
+  }
+  return json.Groups.reduce((n, g) => n + g.length, 0);
+}
+
+export async function preparePreview({before, after, poses, core, pixi, live2dDisplay, pixiUnsafeEval = null, camera = null, mode = 'raw-core'}) {
+  if (!MODES.includes(mode)) fail('E_MODE', `mode must be one of ${MODES.join(', ')}`);
   const routes = new Map();
   for (const name of PREVIEW_FILES) {
     const file = path.join(PREVIEW_DIR, name);
@@ -93,18 +115,27 @@ export async function preparePreview({before, after, poses, core, pixi, live2dDi
     let refs;
     try {
       const model3 = await readJsonFile(modelReal, 1 << 20, 'E_MODEL_JSON', slot);
-      refs = declaredReferences(model3).filter(r => r.kind === 'moc' || r.kind === 'texture');
+      // Only Moc + Textures (+ Pose in sdk-pose mode) are resolved and served; physics, motions,
+      // expressions, sounds etc. are never exposed or loaded.
+      const kinds = mode === 'sdk-pose' ? ['moc', 'texture', 'pose'] : ['moc', 'texture'];
+      refs = declaredReferences(model3).filter(r => kinds.includes(r.kind));
     } catch (e) { throw fromAudit(e, slot); }
+    if (mode === 'sdk-pose' && !refs.some(r => r.kind === 'pose')) fail('E_POSE_FILE_MISSING', `${slot}: model3 declares no FileReferences.Pose (required in sdk-pose mode)`);
     const {resolved, errors} = await resolveReferences(modelDir, refs);
     if (errors.length) fail(errors[0].code, `${slot} ${errors[0].ref}${errors[0].detail ? `: ${errors[0].detail}` : ''}`);
-    const entry = {slot, label: `${slot}: ${safeLabel(path.basename(modelReal))}`, moc: null, textures: []};
+    const entry = {slot, label: `${slot}: ${safeLabel(path.basename(modelReal))}`, moc: null, textures: [], pose: null, poseGroupEntries: null};
+    for (const r of resolved) {
+      if (r.kind !== 'pose') continue;
+      if (path.extname(r.ref).toLowerCase() !== '.json') fail('E_REF_TYPE', `${slot} pose must be .json`);
+      entry.poseGroupEntries = checkPose3(await readJsonFile(r.file, 1 << 20, 'E_POSE_FILE_JSON', `${slot} pose`), slot);
+    }
     resolved.forEach((r, i) => {
       const ext = path.extname(r.ref).toLowerCase();
       if (r.kind === 'moc' && ext !== '.moc3') fail('E_REF_TYPE', `${slot} moc must be .moc3`);
       if (r.kind === 'texture' && !TEXTURE_EXT.has(ext)) fail('E_REF_TYPE', `${slot} texture[${i - 1}] must be png/jpg/webp`);
       const url = `/m/${slot}/r/${i}${ext}`;
       routes.set(url, {file: r.file, real: r.file, base: modelDir, type: TYPES[ext]});
-      if (r.kind === 'moc') entry.moc = url; else entry.textures.push(url);
+      if (r.kind === 'moc') entry.moc = url; else if (r.kind === 'pose') entry.pose = url; else entry.textures.push(url);
     });
     models.push(entry);
   }
@@ -130,8 +161,8 @@ export async function preparePreview({before, after, poses, core, pixi, live2dDi
   const defaultPose = {name: 'default', version: posesVersion, models: Object.fromEntries(SLOT_NAMES.map(slot => [slot, {parameters: {}}]))};
   let cameraConfig = null;
   if (camera) { try { cameraConfig = parseCamera(await readJsonFile(camera, 64 << 10, 'E_CAMERA', 'camera')); } catch (e) { throw fromAudit(e, 'camera'); } }
-  const config = {version: 1, mode: 'raw-core', pixiUnsafeEval: !!pixiUnsafeEval, models, posesVersion, poses: [defaultPose, ...parsedPoses], camera: cameraConfig,
-    note: 'Raw Core mode: SDK Pose, physics, motion, expressions, blink, breath and gaze are disabled. Both A and B arm parts may be visible.'};
+  const config = {version: 1, mode, pixiUnsafeEval: !!pixiUnsafeEval, models, posesVersion, poses: [defaultPose, ...parsedPoses], camera: cameraConfig,
+    note: NOTES[mode]};
   const body = Buffer.from(JSON.stringify(config));
   routes.set('/config.json', {body, type: TYPES['.json']});
   return {routes, config};
@@ -186,7 +217,7 @@ export function createPreviewServer(prepared) {
 }
 
 export function parseArgs(argv) {
-  const takes = {'--before': 'before', '--after': 'after', '--poses': 'poses', '--port': 'port', '--core': 'core', '--pixi': 'pixi', '--live2d-display': 'live2dDisplay', '--pixi-unsafe-eval': 'pixiUnsafeEval', '--camera': 'camera'};
+  const takes = {'--before': 'before', '--after': 'after', '--poses': 'poses', '--port': 'port', '--core': 'core', '--pixi': 'pixi', '--live2d-display': 'live2dDisplay', '--pixi-unsafe-eval': 'pixiUnsafeEval', '--camera': 'camera', '--mode': 'mode'};
   const opts = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -202,7 +233,9 @@ export function parseArgs(argv) {
   for (const required of ['before', 'after', 'poses', 'port', 'core', 'pixi', 'live2dDisplay']) if (!opts[required]) return {error: `missing --${required === 'live2dDisplay' ? 'live2d-display' : required}`};
   const port = Number(opts.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return {error: '--port must be an integer 1-65535'};
-  return {...opts, port};
+  const mode = opts.mode ?? 'raw-core';
+  if (!MODES.includes(mode)) return {error: `--mode must be one of ${MODES.join(', ')}`};
+  return {...opts, port, mode};
 }
 
 const HELP = `Native export pose comparison preview (local, read-only, 127.0.0.1 only)
@@ -210,14 +243,17 @@ const HELP = `Native export pose comparison preview (local, read-only, 127.0.0.1
   node model-work/hiyori-cubism/tools/serve-native-preview.mjs --before <before.model3.json> --after <after.model3.json>
        --poses <poses.json> --port <1-65535> --core <live2dcubismcore.js> --pixi <pixi v6 UMD>
        --live2d-display <pixi-live2d-display cubism4 UMD> [--pixi-unsafe-eval <local pixi-unsafe-eval helper>]
-       [--camera <camera.json>]
+       [--camera <camera.json>] [--mode raw-core|sdk-pose]
 
 The CSP has no 'unsafe-eval'. Pixi 6 needs the local pixi-unsafe-eval helper; without it Pixi
 shader setup is expected to fail and the page reports the error.
 
-Raw Core mode only: SDK Pose, physics, motion, expressions, blink, breath and gaze are disabled,
-so both A and B arm parts may be visible. Pixel differences do not judge anatomy, and never
-override an export-audit incompatibility.
+--mode raw-core (default): SDK Pose, physics, motion, expressions, blink, breath and gaze are
+disabled, so both A and B arm parts may be visible.
+--mode sdk-pose: both model3 files must declare FileReferences.Pose; that pose3.json alone is
+served and evaluated by pixi-live2d-display's CubismPose. Physics, motion, expressions, blink,
+breath and gaze stay disabled. If the pose does not load, the page reports an error.
+Pixel differences do not judge anatomy, and never override an export-audit incompatibility.
 `;
 
 async function main() {

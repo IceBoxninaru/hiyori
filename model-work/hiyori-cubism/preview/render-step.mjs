@@ -45,9 +45,10 @@ export function purgeTextureCache(caches, urls, base = null, alreadyDestroyed = 
 // rejected setup cannot hide a partially created model/Core or its textures.
 // Returns {model, textures, textureTasks, urls} or null when superseded; on
 // rejection everything created so far is disposed and the error is rethrown.
-export async function loadOwnedModel({PIXI, settings, options, urls, isCurrent, dispose}) {
+export async function loadOwnedModel({PIXI, settings, options, urls, isCurrent, dispose, onCreate = () => {}}) {
   const model = new PIXI.live2d.Live2DModel(options);
   const record = {model, textures: new Set(), textureTasks: [], urls, disposed: false};
+  onCreate(model, record); // attach listeners before setup emits load events
   model.once('settingsLoaded', loaded => {
     for (const file of loaded.textures) {
       const url = loaded.resolveURL(file);
@@ -111,6 +112,29 @@ export async function loadSlotsOwned(entries, {guard, token, loadOne, dispose}) 
   } finally {
     if (!committed) await Promise.all(Object.values(loaded).map(record => dispose(record)));
   }
+}
+
+// SDK Pose load state. pixi-live2d-display 0.4.0 (setupOptionals) loads FileReferences.Pose,
+// sets internalModel.pose = runtime.createPose(...) and emits 'poseLoaded', or emits
+// 'poseLoadError' WITHOUT rejecting setup - so the page must watch these events itself.
+export function watchSdkPose(model, requested) {
+  const status = {requested, loaded: false, error: false, ran: 0};
+  if (requested) {
+    model.once('poseLoaded', () => { status.loaded = true; });
+    model.once('poseLoadError', () => { status.error = true; });
+  }
+  return status;
+}
+
+// Returns the loaded CubismPose, or throws: sdk-pose mode never reports success without it.
+export function requireSdkPose(internalModel, status) {
+  const pose = internalModel?.pose;
+  const usable = pose && typeof pose.reset === 'function' && typeof pose.updateParameters === 'function';
+  if (!status.loaded || status.error || !usable) {
+    throw Object.assign(new Error('E_SDK_POSE_UNAVAILABLE'), {code: 'E_SDK_POSE_UNAVAILABLE',
+      detail: status.error ? 'pose3.json failed to load (poseLoadError)' : !status.loaded ? 'poseLoaded was not emitted' : 'CubismPose reset/updateParameters missing'});
+  }
+  return pose;
 }
 
 // Per-generation resource URLs: the server ignores the query, and a reload can

@@ -147,14 +147,55 @@ export function partOpacityDiff(rawModel, state) {
   return out;
 }
 
-// Replaces the SDK wrapper's per-frame update with: reset -> apply pose -> Core update.
-// No motion, expression, blink, breath, physics, SDK Pose or focus runs.
-export function installDeterministicUpdate(internalModel, rawModel, state, getPose, onApplied = () => {}) {
+// Replaces the SDK wrapper's per-frame update with a deterministic still-image step.
+//
+// raw-core (sdkPose = null):
+//   1. reset every parameter/part opacity to the declared state, apply the named values
+//   2. Core update
+// sdk-pose (sdkPose = the wrapper's CubismPose, internalModel.pose):
+//   1. same reset + named values
+//   2. sdkPose.reset(coreModel): re-initializes every pose group (first part visible) and the
+//      pose switch parameters, including framework-side ones a raw reset cannot reach
+//   3. re-apply the named values, so explicit pose-file values win over the switch reset
+//   4. mark coreModel as the pose's last model, so updateParameters does not run a second,
+//      hidden reset on its first call (that would make the first render differ from later ones)
+//   5. sdkPose.updateParameters(coreModel, SDK_POSE_SETTLE_SECONDS): the real SDK fade,
+//      settled completely, plus link copying
+//   6. Core update
+// Motion, expression, blink, breath, physics and focus never run.
+export const SDK_POSE_SETTLE_SECONDS = 1000;
+
+export function installDeterministicUpdate(internalModel, rawModel, state, getPose, onApplied = () => {}, {sdkPose = null, onPoseStep = () => {}} = {}) {
   const coreModel = internalModel.coreModel;
-  internalModel.update = function deterministicRawCoreUpdate() {
-    onApplied(applyPose(rawModel, state, getPose()));
+  if (sdkPose && !(fn(sdkPose, 'reset') && fn(sdkPose, 'updateParameters'))) fail('E_SDK_POSE_UNAVAILABLE', 'CubismPose reset/updateParameters not available');
+  internalModel.update = function deterministicStillUpdate() {
+    const pose = getPose();
+    applyPose(rawModel, state, pose);
+    if (sdkPose) {
+      sdkPose.reset(coreModel);
+      reapplyNamed(rawModel, state, pose);
+      sdkPose._lastModel = coreModel;
+      sdkPose.updateParameters(coreModel, SDK_POSE_SETTLE_SECONDS);
+      onPoseStep({ran: true, settleSeconds: SDK_POSE_SETTLE_SECONDS});
+    }
+    onApplied(readBack(rawModel, state, pose));
     if (fn(coreModel, 'update')) coreModel.update(); else rawModel.update();
   };
+}
+
+function reapplyNamed(rawModel, state, pose) {
+  const index = new Map(state.parameters.map((q, i) => [q.id, i]));
+  for (const [id, v] of Object.entries(pose.parameters)) rawModel.parameters.values[index.get(id)] = v;
+}
+
+function readBack(rawModel, state, pose) {
+  const index = new Map(state.parameters.map((q, i) => [q.id, i]));
+  return Object.fromEntries(Object.keys(pose.parameters).map(id => [id, rawModel.parameters.values[index.get(id)]]));
+}
+
+// All part opacities after a render, by part ID (diagnostic).
+export function partOpacities(rawModel, state) {
+  return Object.fromEntries(state.parts.map((part, i) => [part.id, rawModel.parts.opacities[i]]));
 }
 
 // Differences that make before/after geometry non-comparable by identity.

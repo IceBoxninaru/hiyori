@@ -173,6 +173,7 @@ node model-work/hiyori-cubism/tools/serve-native-preview.mjs \
   `@pixi/unsafe-eval` helper for the same Pixi version. It is served as the fourth exact
   vendor file and loaded right after Pixi, so the CSP needs no `'unsafe-eval'`. Without
   it, Pixi 6 shader setup is expected to fail under the CSP, and the page says so.
+- `--mode raw-core|sdk-pose` (optional; default `raw-core`, unchanged behaviour). See "SDK Pose mode" below.
 - `--port` is required and must be 1–65535. The server binds **127.0.0.1 only** and
   exits if the port is busy.
 - `--camera` (optional) is
@@ -310,3 +311,53 @@ WebGL, Pixi or texture rendering, which is verified locally.
 - real Core/Pixi rendering with textures;
 - an identical shoulder crop camera for before and after;
 - no app behaviour changes.
+
+## SDK Pose mode (`--mode sdk-pose`)
+
+Raw-core mode leaves SDK Pose off, so the A and B arm sets both render: up to four arms in total. That can't
+verify the final two-arm result. `--mode sdk-pose` evaluates the model's own `pose3.json` through the real
+pixi-live2d-display 0.4.0 `CubismPose`. Checked against public source: pixi-live2d-display v0.4.0 (`12148332`,
+`src/factory/model-middlewares.ts`, `src/cubism4/Cubism4InternalModel.ts`) and its pinned CubismWebFramework
+(`1f9cdfd`, `src/effect/cubismpose.ts`).
+
+**Server:**
+- Both `before` and `after` model3 files must declare `FileReferences.Pose`. Otherwise startup fails with
+  `E_POSE_FILE_MISSING` naming the slot.
+- The Pose reference goes through the same checks as Moc/Textures: URL, absolute, `..` and link escapes are
+  rejected.
+- It must be `.json`, valid JSON (`E_POSE_FILE_JSON`), and have a non-empty `Groups` array of groups whose
+  entries have a string `Id` and optional `Link` string arrays (`E_POSE_FILE_SCHEMA`).
+- Only that file is added, as `/m/<slot>/r/<n>.json`. Physics, motions, expressions and sounds are still never
+  served or loaded. Localhost-only binding, opaque aliases, CSP, `no-store` and path redaction are unchanged.
+
+**Page:**
+- The settings object passed to `Live2DFactory.setupLive2DModel` contains Moc, Textures and Pose only.
+- In 0.4.0, `setupOptionals` loads the pose, sets `internalModel.pose = runtime.createPose(...)`, and emits
+  `poseLoaded`. On failure it emits `poseLoadError` **without rejecting setup**.
+- The page watches both events. It refuses the model with `E_SDK_POSE_UNAVAILABLE` unless `poseLoaded` fired,
+  no error fired, and `internalModel.pose` has `reset` and `updateParameters`.
+- The pose is never imitated by hand-written part opacities.
+
+**Every render** (`installDeterministicUpdate` in `preview/pose-core.mjs`):
+1. Reset all parameters and part opacities to the declared state, then apply this slot's named values.
+2. `pose.reset(coreModel)`: every group back to its first part, and the pose switch parameters re-initialized.
+   This includes framework-side switch values for part IDs that are not real parameters, which a raw Core
+   reset cannot reach.
+3. Re-apply the named values, so explicit pose-file values win.
+4. Set `pose._lastModel = coreModel`. Otherwise the SDK's first `updateParameters` runs a second, hidden
+   `reset`, and the first render would differ from later ones.
+5. `pose.updateParameters(coreModel, 1000 s)`: the real fade, fully settled, plus link copying.
+6. Core update.
+
+Motion, expressions, blink, breath, physics and focus stay off. The result is a still image, whatever order
+the poses were selected in.
+
+**Diagnostics:** mode, per slot `sdkPose: {loaded, loadError, evaluatedRenders}`, the full `partOpacities` and
+the non-default part opacities. The PNG header states the mode and whether the pose was evaluated for each
+slot.
+
+**Limits:**
+- Setting `_lastModel` touches a field that is public in the TypeScript source but undocumented.
+- Real Pixi, CubismPose and the two-arm result are verified only in a real local browser.
+- The synthetic fake CubismPose in the tests follows the pinned source's rules for one group. It is not a
+  display check of a real model.

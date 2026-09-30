@@ -10,10 +10,10 @@ import http from 'node:http';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {preparePreview, createPreviewServer, resolveRequest, parseArgs, parseCamera, PREVIEW_FILES} from '../tools/serve-native-preview.mjs';
-import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, parsePosesV2, poseForSlot, sharedPosesAsModels} from '../preview/pose-core.mjs';
+import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, parsePosesV2, poseForSlot, sharedPosesAsModels, partOpacities, SDK_POSE_SETTLE_SECONDS} from '../preview/pose-core.mjs';
 import {compareReports, runAudit} from '../src/export-audit.mjs';
 import {createLoadGuard} from '../preview/load-guard.mjs';
-import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, FIXED_UPDATE_MS} from '../preview/render-step.mjs';
+import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, FIXED_UPDATE_MS, watchSdkPose, requireSdkPose} from '../preview/render-step.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WIN = process.platform === 'win32';
@@ -256,7 +256,7 @@ test('CLI: explicit port required, usage/startup errors redacted, --help documen
   assert.equal(parseArgs(['--/Users/example-private']).error, 'unknown argument (value redacted)');
   const cli = path.join(HERE, '..', 'tools', 'serve-native-preview.mjs');
   const help = spawnSync(process.execPath, [cli, '--help'], {encoding: 'utf8'});
-  assert.equal(help.status, 0); assert.match(help.stdout, /Raw Core mode only/);
+  assert.equal(help.status, 0); assert.match(help.stdout, /--mode raw-core \(default\)/); assert.match(help.stdout, /--mode sdk-pose/);
   const fx = await fixture();
   try {
     const run = spawnSync(process.execPath, [cli, '--before', fx.opts.before, '--after', fx.opts.after, '--poses', fx.opts.poses, '--port', '5199',
@@ -639,4 +639,158 @@ test('audit stays strict: v2 files are refused and differing pose inputs never b
   const sameInputs = compareReports(report([['default', {}, 'g0'], ['shrug', {ParamShoulder: 1}, 'g1']], 'm1'), original);
   assert.equal(sameInputs.classification, 'bytes-changed-poses-identical', 'shared old poses unchanged: comparable, no editProof');
   assert.equal(sameInputs.editProof, false);
+});
+
+// ---- sdk-pose mode (synthetic: fake pose3 files, fake CubismPose; not real SDK rendering) --------
+const POSE3 = {Type: 'Live2D Pose', FadeInTime: 0.5, Groups: [[{Id: 'PartArmA', Link: []}, {Id: 'PartArmB', Link: []}]]};
+async function poseFixture(pose = POSE3, ref = 'hiyori.pose3.json') {
+  const fx = await fixture({extraModel: {Pose: ref}});
+  for (const slot of ['before', 'after']) await writeFile(path.join(fx.dir, slot, 'hiyori.pose3.json'), typeof pose === 'string' ? pose : JSON.stringify(pose));
+  return fx;
+}
+
+test('mode argument: raw-core by default, sdk-pose explicit, anything else refused', async () => {
+  const base = ['--before=a', '--after=b', '--poses=p', '--core=c', '--pixi=x', '--live2d-display=l', '--port=5190'];
+  assert.equal(parseArgs(base).mode, 'raw-core');
+  assert.equal(parseArgs([...base, '--mode', 'sdk-pose']).mode, 'sdk-pose');
+  assert.match(parseArgs([...base, '--mode=sdk_pose']).error, /--mode must be one of raw-core, sdk-pose/);
+  const fx = await fixture();
+  try {
+    await assert.rejects(preparePreview({...fx.opts, mode: 'pose'}), e => e.code === 'E_MODE');
+    const raw = await preparePreview(fx.opts);
+    assert.equal(raw.config.mode, 'raw-core'); assert.equal(raw.config.models[0].pose, null);
+  } finally { await fx.cleanup(); }
+});
+
+test('sdk-pose serves only the model3 Pose besides Moc/Textures; raw-core never serves it', async () => {
+  const fx = await poseFixture();
+  try {
+    const prepared = await preparePreview({...fx.opts, mode: 'sdk-pose'});
+    assert.equal(prepared.config.mode, 'sdk-pose');
+    assert.deepEqual(prepared.config.models.map(m => [m.pose, m.poseGroupEntries]), [['/m/before/r/2.json', 2], ['/m/after/r/2.json', 2]]);
+    await withServer(prepared, async get => {
+      const r = await get('/m/after/r/2.json?g=3');
+      assert.equal(r.status, 200); assert.equal(JSON.parse(r.body).Groups[0][1].Id, 'PartArmB');
+      assert.equal(r.headers['cache-control'], 'no-store'); assert.match(r.headers['content-security-policy'], /default-src 'none'/);
+      for (const bad of ['/m/before/hiyori.physics3.json', '/m/before/r/3.json', '/m/before/hiyori.pose3.json']) assert.equal((await get(bad)).status, 404, bad);
+    });
+    assert.ok(!JSON.stringify(prepared.config).includes(fx.dir));
+    const raw = await preparePreview(fx.opts); // same model3 files, default mode
+    assert.ok(![...raw.routes.keys()].some(u => u.endsWith('.json') && u.startsWith('/m/')), 'raw-core: Pose not served');
+  } finally { await fx.cleanup(); }
+});
+
+test('sdk-pose fails closed: missing Pose (either slot), invalid JSON, bad schema, URL/absolute/escaping refs', async () => {
+  let fx = await fixture();
+  try { await assert.rejects(preparePreview({...fx.opts, mode: 'sdk-pose'}), e => e.code === 'E_POSE_FILE_MISSING' && e.message.includes('before')); }
+  finally { await fx.cleanup(); }
+  fx = await poseFixture();
+  try {
+    const m = JSON.parse(await readFile(fx.opts.after, 'utf8')); delete m.FileReferences.Pose;
+    await writeFile(fx.opts.after, JSON.stringify(m));
+    await assert.rejects(preparePreview({...fx.opts, mode: 'sdk-pose'}), e => e.code === 'E_POSE_FILE_MISSING' && e.message.startsWith('E_POSE_FILE_MISSING: after'));
+  } finally { await fx.cleanup(); }
+  for (const [pose, code] of [['{not json', 'E_POSE_FILE_JSON'], [{Groups: []}, 'E_POSE_FILE_SCHEMA'], [{Groups: [[{Link: []}]]}, 'E_POSE_FILE_SCHEMA'], [{FadeInTime: 'x', Groups: [[{Id: 'A'}]]}, 'E_POSE_FILE_SCHEMA']]) {
+    fx = await poseFixture(pose);
+    try { await assert.rejects(preparePreview({...fx.opts, mode: 'sdk-pose'}), e => e.code === code && !e.message.includes(fx.dir), code); }
+    finally { await fx.cleanup(); }
+  }
+  for (const ref of ['https://example.invalid/p.pose3.json', '/Users/example-private/p.pose3.json', '../outside.pose3.json']) {
+    fx = await poseFixture(POSE3, ref);
+    try { await assert.rejects(preparePreview({...fx.opts, mode: 'sdk-pose'}), e => /^E_REF_/.test(e.code) && !e.message.includes('example-private') && !e.message.includes(fx.dir), ref); }
+    finally { await fx.cleanup(); }
+  }
+});
+
+test('SDK Pose load failures never count as sdk-pose success', () => {
+  const model = () => { const l = {}; return {once(e, f) { l[e] = f; }, fire(e) { l[e]?.(); }}; };
+  const pose = {reset() {}, updateParameters() {}};
+  let m = model(), status = watchSdkPose(m, true); m.fire('poseLoadError');
+  assert.throws(() => requireSdkPose({pose}, status), e => e.code === 'E_SDK_POSE_UNAVAILABLE' && /poseLoadError/.test(e.detail));
+  m = model(); status = watchSdkPose(m, true);
+  assert.throws(() => requireSdkPose({pose}, status), e => e.code === 'E_SDK_POSE_UNAVAILABLE' && /not emitted/.test(e.detail));
+  m = model(); status = watchSdkPose(m, true); m.fire('poseLoaded');
+  assert.throws(() => requireSdkPose({pose: {reset() {}}}, status), e => e.code === 'E_SDK_POSE_UNAVAILABLE');
+  assert.throws(() => requireSdkPose({}, status), e => e.code === 'E_SDK_POSE_UNAVAILABLE');
+  assert.equal(requireSdkPose({pose}, status), pose);
+  assert.deepEqual(watchSdkPose(model(), false), {requested: false, loaded: false, error: false, ran: 0});
+  const f = fakeCore(SPEC()); const state = readDeclaredState(f.core, MOC);
+  assert.throws(() => installDeterministicUpdate({coreModel: {}}, f.newModel(), state, () => ({name: 'd', parameters: {}}), () => {}, {sdkPose: {}}), e => e.code === 'E_SDK_POSE_UNAVAILABLE');
+});
+
+// A fake CubismPose that follows the pinned framework's reset/updateParameters/doFade rules for
+// one group, with its switch values held OUTSIDE the raw Core arrays (framework-side), as for
+// part IDs that are not real parameters.
+function fakeCubismPose(log, fadeSeconds = 0.5) {
+  return {
+    _lastModel: undefined, switches: {PartArmA: 0, PartArmB: 0}, parts: ['PartArmA', 'PartArmB'],
+    reset(model) { log.push('reset'); this.parts.forEach((id, j) => { model.setPartOpacity(id, j === 0 ? 1 : 0); this.switches[id] = j === 0 ? 1 : 0; }); },
+    updateParameters(model, dt) {
+      log.push(`update:${this._lastModel === model ? 'same' : 'hidden-reset'}:${dt}`);
+      if (model !== this._lastModel) this.reset(model);
+      this._lastModel = model;
+      let visible = this.parts.findIndex(id => this.switches[id] > 0.001), next = 1;
+      if (visible >= 0) next = Math.min(1, model.getPartOpacity(this.parts[visible]) + dt / fadeSeconds); else visible = 0;
+      this.parts.forEach((id, i) => {
+        if (i === visible) model.setPartOpacity(id, next);
+        else { const a1 = next < 0.5 ? next * (0.5 - 1) / 0.5 + 1 : (1 - next) * 0.5 / 0.5; model.setPartOpacity(id, Math.min(model.getPartOpacity(id), a1)); }
+      });
+    },
+  };
+}
+function sdkPoseRig(log) {
+  const f = fakeCore(PROBE_SPEC());
+  const state = readDeclaredState(f.core, MOC), raw = f.newModel();
+  const idx = id => state.parts.findIndex(p => p.id === id);
+  const coreModel = {
+    setPartOpacity(id, v) { raw.parts.opacities[idx(id)] = v; }, getPartOpacity(id) { return raw.parts.opacities[idx(id)]; },
+    update() { log.push(`core:${Array.from(raw.parts.opacities).join(',')}:${Array.from(raw.parameters.values).join(',')}`); raw.update(); },
+  };
+  return {state, raw, coreModel};
+}
+
+test('sdk-pose order: declared reset + named values, CubismPose.reset, named re-applied, no hidden reset, settled update, Core update', () => {
+  const log = [];
+  const {state, raw, coreModel} = sdkPoseRig(log);
+  const sdkPose = fakeCubismPose(log);
+  const origReset = sdkPose.reset.bind(sdkPose);
+  sdkPose.reset = model => { log.push(`named-before-reset:${raw.parameters.values[3]}`); origReset(model); raw.parameters.values[3] = 0; }; // a reset that clobbers a named value
+  let applied = null, steps = 0;
+  const internal = {coreModel};
+  installDeterministicUpdate(internal, raw, state, () => ({name: 'raise', parameters: {ParamArmRaiseR: 1}}), a => { applied = a; }, {sdkPose, onPoseStep: () => { steps++; }});
+  raw.parts.opacities[1] = 0.7; raw.parameters.values[1] = 1; // stale state from a previous pose
+  internal.update();
+  assert.deepEqual(log, ['named-before-reset:1', 'reset', `update:same:${SDK_POSE_SETTLE_SECONDS}`, 'core:1,0:0,0,0.5,1']);
+  assert.deepEqual(applied, {ParamArmRaiseR: 1}, 'explicit value re-applied after the pose switch reset');
+  assert.equal(steps, 1);
+  assert.deepEqual(partOpacities(raw, state), {PartArmA: 1, PartArmB: 0}, 'one arm set visible after the settled SDK fade');
+});
+
+test('sdk-pose repeated selection is path independent (A, B, A equals A fresh; first render equals later ones)', () => {
+  const render = sequence => {
+    const log = [];
+    const {state, raw, coreModel} = sdkPoseRig(log);
+    const sdkPose = fakeCubismPose(log);
+    let current;
+    const internal = {coreModel};
+    installDeterministicUpdate(internal, raw, state, () => current, () => {}, {sdkPose});
+    const snaps = [];
+    for (const pose of sequence) { current = pose; internal.update(); snaps.push([Array.from(raw.parameters.values), Array.from(raw.parts.opacities)]); }
+    return snaps;
+  };
+  const A = {name: 'a', parameters: {ParamArmRaiseR: 1}}, B = {name: 'b', parameters: {ParamShoulder: 1, ParamAngleX: -20}};
+  const fresh = render([A])[0];
+  const path = render([A, B, A, A]);
+  assert.deepEqual(path[2], fresh); assert.deepEqual(path[3], fresh); assert.deepEqual(path[0], fresh);
+  assert.deepEqual(render([B, A])[1], fresh);
+});
+
+test('raw-core compatibility: no pose object is touched and the update order is unchanged', () => {
+  const log = [];
+  const {state, raw, coreModel} = sdkPoseRig(log);
+  const internal = {coreModel};
+  installDeterministicUpdate(internal, raw, state, () => ({name: 'r', parameters: {ParamArmRaiseR: 1}}), () => {});
+  raw.parts.opacities[1] = 0.7;
+  internal.update();
+  assert.deepEqual(log, ['core:1,0.25:0,0,0.5,1'], 'raw Core: declared part opacities kept, no SDK Pose step');
 });
