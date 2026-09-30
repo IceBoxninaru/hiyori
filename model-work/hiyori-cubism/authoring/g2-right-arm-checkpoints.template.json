@@ -20,9 +20,9 @@
       {"role": "upper-arm-warp", "displayName": null, "id": null, "parentId": null, "pivotCanvasPx": null, "keyedParameters": null}
     ],
     "glue": [
-      {"objectA": null, "objectB": null, "weightPercent": null}
+      {"objectA": null, "objectB": null, "weightPercent": null, "weightIsPoseIndependent": "per-vertex Glue weight cannot be keyed per pose", "applicabilityPoseDependent": null, "applicabilityControlUsed": null}
     ],
-    "poseGroup": {"armAPartId": null, "armBPartId": null, "groupNumber": null, "armBEditorVisibilityOff": null}
+    "poseGroup": {"armAPartId": null, "armBPartId": null, "groupNumber": null, "sharedBilateralGroup": null, "armBEditorVisibilityOff": null}
   },
   "angleConvention": {
     "positiveAngleScreenDirection": null,
@@ -47,9 +47,10 @@
     "insertionRationale": null,
     "pivotCanvasPx": null,
     "pivotSetByCtrlDragAtNeutral": null,
-    "neutralUnchangedAfterInsertion": null,
+    "neutralReferenceAngleDeg": null,
+    "neutralImageUnchangedAfterInsertion": null,
     "keys": [
-      {"parameterValue": 0, "angleDeg": null, "note": "neutral; angle expected to remain unchanged - record the actual value"},
+      {"parameterValue": 0, "angleDeg": null, "note": "neutral; record the observed neutral reference angle and confirm the neutral image is unchanged"},
       {"parameterValue": null, "angleDeg": null, "note": "shoulder-level (if a key is needed)"},
       {"parameterValue": null, "angleDeg": null, "note": "beside-head (if a key is needed)"},
       {"parameterValue": 1, "angleDeg": null, "note": "overhead"}
@@ -59,6 +60,7 @@
     {"warpDeformerId": null, "keyedParameter": null, "keyValues": null, "reason": null}
   ],
   "oldKeyformsUnchanged": {
+    "baseline": "untouched G0-before (original) export - not the G0-after +3 degree witness",
     "sweptParameters": null,
     "matchesG0Export": null,
     "notes": null
@@ -72,8 +74,14 @@
   ],
   "intermediateSweep": {"stepsReviewed": null, "backgrounds": ["white", "dark"], "issuesAtValues": null},
   "persistence": {"savedClosedReopened": null, "parameterAndKeysPresentAfterReopen": null},
-  "export": {"exportVersionChoice": null, "mocVersion": null, "coreVersion": null, "auditExitCode": null, "auditComparisonClassification": null, "auditEditProof": null},
-  "webglCheck": {"rawCorePreviewReviewed": null, "sdkPoseViewReviewed": null, "sameCameraBeforeAfter": null, "rightArmsDrawnRawCore": null, "rightArmsDrawnSdkPose": null},
+  "export": {"baselineExport": "untouched G0-before (original) export", "exportVersionChoice": null, "mocVersion": null, "coreVersion": null, "auditExitCode": null, "auditComparisonClassification": null, "auditEditProof": null},
+  "webglCheck": {"rawCorePreviewReviewed": null, "sdkPoseViewReviewed": null, "sameCameraBeforeAfter": null, "rightSideArmsDrawnRawCore": null, "totalArmsDrawnRawCore": null, "rightSideArmsDrawnPoseEnabled": null, "totalArmsDrawnPoseEnabled": null, "expected": "raw Core: 2 right-side, up to 4 total (diagnostic); Pose-enabled: 1 right-side, 2 total"},
+  "newAssemblyDifferences": {
+    "comparedAgainst": "untouched G0-before (original) export",
+    "neutralDifferences": null,
+    "oldArmMotionDifferences": null,
+    "coordinatorAcceptanceDecision": null
+  },
   "redrawDecision": {
     "decision": null,
     "criteriaTriggered": [],

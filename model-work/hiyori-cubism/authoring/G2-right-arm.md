@@ -22,7 +22,7 @@ following a step. Where the Editor differs, the Editor wins; note the difference
 | Deformer basics / parenting | [About Deformers](https://docs.live2d.com/en/cubism-editor-manual/deformer/), [Warp Deformer](https://docs.live2d.com/en/cubism-editor-manual/making-and-placement-of-warp-deformer/) | Ctrl held while moving a deformer; otherwise the contents move with it |
 | Parameters | [About Parameters](https://docs.live2d.com/en/cubism-editor-manual/parameter/), [Parameter palette](https://docs.live2d.com/en/cubism-editor-manual/palametorpalatte/) | "Create New Parameter" dialog; its Blend Shape checkbox stays **off** here |
 | Keys | [Add/Delete Keys](https://docs.live2d.com/en/cubism-editor-manual/edit-parameters/), [Multiple Keys Editing](https://docs.live2d.com/en/cubism-editor-manual/multi-key/), [Keyforms](https://docs.live2d.com/en/cubism-editor-manual/keyform-xydirection/) | [Add 2 Keyforms] / [Add 3 Keyforms] at the top of the Parameter palette; green dots mark keys |
-| Glue | [Glue](https://docs.live2d.com/en/cubism-editor-manual/glue/) | Glue weight 0–100 %; a higher weight gives that object's movement priority |
+| Glue | [Glue](https://docs.live2d.com/en/cubism-editor-manual/glue/) | Glue weight 0–100 %; a higher weight gives that object's movement priority. The weight is not keyable per pose; only Glue applicability is |
 | Parts / pose group | [Parts palette](https://docs.live2d.com/en/cubism-editor-manual/partspalatte/), [Pose Settings](https://docs.live2d.com/4.2/en/cubism-editor-manual/pose-setting/) | Parts with the same group number: only one is displayed. The manual places adding a pose under File > Add > Pose; confirm whether that is in the Editor or the Viewer in 5.3 |
 | Mesh edits (only if needed) | [Edit Mesh manually](https://docs.live2d.com/en/cubism-editor-manual/mesh-edit-manual/) | — |
 | Export | [Data for Embedded Use](https://docs.live2d.com/en/cubism-editor-manual/export-moc3-motion3-files/) | Export as moc3 file, with an export version choice |
@@ -34,6 +34,9 @@ Known facts:
 - Editor 5.3.04 works.
 - G0 is accepted: after a native save, reopen and export (SDK 4.0 export), `ParamShoulder=0` matches and
   `ParamShoulder=1` differs in real WebGL.
+- **Baseline for every G2 comparison:** the untouched G0-before export (the original, byte-identical to the
+  sample moc3). The G0-after export is the deliberate +3° shoulder witness. At `ParamShoulder=1` it
+  intentionally differs, so it is never a G2 baseline.
 - The embedded PSD exports as 106 raster layers plus 17 groups, at 2976 × 4175.
 - Eight right-arm source PNGs were extracted with exact RGBA equality. They stay local.
 - Arm A (original) and arm B (bent) form **one mutually exclusive pose group**. B's temporary Editor
@@ -94,9 +97,9 @@ Never copy a guessed value into the template.
    invites accidental edits to old combinations.
 3. Select exactly one object before adding keys, and confirm the Parameter palette shows keys only on the
    intended parameter.
-4. After each edit, sweep every **old** arm parameter and `ParamShoulder` with `ParamArmRaiseR=0`. The result
-   must look exactly as in the G0 export. Any difference means an old keyform was touched: reopen the last
-   snapshot.
+4. After each edit, sweep every **old** arm parameter and `ParamShoulder` with `ParamArmRaiseR=0`. Compare
+   with the **untouched G0-before (original) export**, not the +3° G0-after witness. Any difference means an old
+   keyform was touched: reopen the last snapshot.
 5. Corrective shape keys (section 6.6) go on **new** warp deformers keyed only by `ParamArmRaiseR`. An
    existing warp is edited only with a written reason.
 
@@ -136,16 +139,19 @@ With all parameters at default, record the following in `inventory` in the templ
    upper-arm rotation, and the whole A arm inherits it. If the observed hierarchy makes another insertion point
    more correct, record why.
 3. With every parameter at default, Ctrl+drag its pivot to the operator-judged shoulder joint centre (inside
-   the cap). Leave its angle at 0 so neutral is unchanged.
-4. Confirm the neutral render is pixel-identical to the pre-insertion snapshot. Use the local preview harness
-   with `default` for before/after.
+   the cap). Record the angle the new deformer actually shows at neutral as the neutral reference; do not
+   change it. Locally it has been observed as 0°, but that is a recorded observation, not a rule.
+4. **Check the neutral image:** it must be pixel-identical to the pre-insertion snapshot. Use the local
+   preview harness with `default` for before/after. If it differs, the insertion or pivot move changed the
+   neutral: revert.
 
 ### 6.4 Keys on `ParamArmRaiseR` only
 
 1. Select the new deformer and `ParamArmRaiseR`, then click [Add 2 Keyforms], giving keys at 0 and 1.
 2. Add keys at intermediate values only where an intermediate checkpoint needs its own form, following the
    Add/Delete Keys page. Start with the fewest keys that give smooth motion. Record every key value.
-3. **Key 0:** angle stays 0 (neutral).
+3. **Key 0:** keep the recorded neutral reference angle from 6.3, whatever it is. Confirm the neutral image
+   again after adding keys.
 4. **Key 1:** with the slider exactly on 1, edit the angle until the hand is overhead. Use the direction
    observed in 6.2 and record the value you actually typed; there is no preset angle.
 5. **Intermediate keys:** set the angle that places the arm at shoulder level and beside the head. Record the
@@ -155,8 +161,12 @@ With all parameters at default, record the following in `inventory` in the templ
 
 At every checkpoint (section 7), and at every 0.1 step between them, inspect the shoulder cap / upper-sleeve
 join:
-- **Glue:** does the glued seam hold? Does the weight pull the cap or the sleeve? Record any weight change
-  and why.
+- **Glue:** does the glued seam hold? Does the weight pull the cap or the sleeve?
+  - The per-vertex Glue **weight** is a single, pose-independent setting. It cannot be keyed per pose, so a
+    change affects every pose; re-check all checkpoints after any change and record why.
+  - Only whether Glue **applies** can depend on the pose. Confirm the Editor's control for this in the Glue
+    manual page, and record how it was used.
+  - Pose-specific seam shaping belongs in warp keyforms (6.6), never in Glue weights.
 - **Overlap:** is there intentional hidden overlap, or is joint art exposed that was never drawn?
 - **Outline:** are there double outlines where two edges meet?
 - **Sleeve:** does its thickness collapse or pinch?
@@ -175,7 +185,8 @@ Check all of these against both white and dark backgrounds.
 
 1. Save, close and reopen. Confirm the parameter, keys and angles are still present.
 2. Export moc3 at the version used for G0 (SDK 4.0), within the local Core's MocVersion ≤ 5.
-3. Run `tools/audit-export.mjs` against the G0 export as baseline. Use a poses file with
+3. Run `tools/audit-export.mjs` with the **untouched G0-before (original) export** as baseline, not the +3°
+   G0-after witness. Use a poses file with
    `ParamArmRaiseR` **only after** the export shows the ID. Expect geometry change at non-zero values, and
    none at 0 against the baseline.
 4. Run `tools/serve-native-preview.mjs` for a same-camera before/after in raw-Core mode, which shows both A
@@ -187,7 +198,7 @@ Check all of these against both white and dark backgrounds.
 
 | Checkpoint | `ParamArmRaiseR` | Meaning |
 | --- | --- | --- |
-| down | 0 | Must match the G0 export's neutral |
+| down | 0 | Must match the untouched G0-before (original) export's neutral |
 | shoulder-level | recorded value | Upper arm roughly horizontal |
 | beside-head | recorded value | Hand at head height beside the head |
 | overhead | 1 | Hand above the head |
@@ -213,30 +224,33 @@ Stop repairing and propose a redrawn assembly when any of these persists after o
 
 Record which criteria fired, with the checkpoint and parameter value. Screenshots stay local.
 
-## 9. Replacing the old A arm with a redrawn assembly (no four-arm rendering)
+## 9. Replacing the old A arm with a redrawn assembly
 
 Only after section 8 fires, and only with new art made by the separate image subagent that has **passed
 native fitting**. No new generation is authorized by this document.
 
 1. **Scope:** start with a coherent shoulder-to-hand right-arm assembly. Extend to the upper body, and only
-   then the whole body, only when that is needed to keep Hiyori's appearance.
+   then the whole body, only when that is needed.
 2. **Placement:** build the new ArtMeshes inside the **arm-A part** of a new Save-As copy, under the same
-   raise-deformer chain. This keeps the existing mutually exclusive A/B pose group, so SDK Pose shows either
-   the new A or B, never both.
+   raise-deformer chain. ArmA and ArmB are **one shared, bilateral** mutually exclusive pose group: each
+   part holds both the left and the right arm of its set. Keeping the new right arm in arm A therefore keeps
+   SDK Pose choosing one arm set (A or B) for both sides.
 3. **Remove the old A art from rendering:** delete the old A ArtMeshes in that working copy, or move them to a
    part that is explicitly excluded from export. Record the choice. Do not rely on Editor eye-icon visibility,
    and do not leave old and new A both drawable.
 4. **Expected counts:**
 
-   | View | Right arms drawn |
-   | --- | --- |
-   | Raw-Core preview (SDK Pose off) | 2: new A + original B, as the page warns |
-   | SDK Pose | 1 |
-   | Anywhere | never 3 or 4 |
+   | View | Character-right side | Total arms |
+   | --- | --- | --- |
+   | Raw-Core preview (SDK Pose off, diagnostic) | 2: new A + original B | 4 is legitimate, as the page warns |
+   | Final Pose-enabled render | 1 | 2 |
 
-   Verify the counts from drawable IDs in the audit report and visually.
-5. Repeat sections 4–7 for the new assembly. The neutral should match Hiyori's original appearance as closely
-   as the new art allows. Any visible neutral difference is recorded, not hidden.
+   Any count above these (for example old A still drawable next to new A) is a defect. Verify the counts from
+   drawable IDs in the audit report and visually.
+5. Repeat sections 4–7 for the new assembly. An intentionally new assembly is **not** required to reproduce
+   the old appearance or the old motion. Instead, record each difference against the untouched G0-before
+   export as an explicit acceptance decision for the coordinator: neutral shape/colour/line, and the old
+   arm-parameter motion. Differences are recorded, never hidden.
 
 ## 10. What completion does and does not mean
 
@@ -245,5 +259,6 @@ native fitting**. No new generation is authorized by this document.
 - Completion needs:
   - an exported moc3 containing the new parameter;
   - clean shoulder/sleeve at every checkpoint in real WebGL, with SDK Pose and in raw-Core mode;
-  - unchanged old-parameter behaviour;
+  - old-parameter behaviour unchanged against the untouched G0-before export (repair path), or, for an
+    accepted new assembly, each recorded difference explicitly accepted;
   - the coordinator's acceptance.
