@@ -159,15 +159,54 @@ export function partOpacityDiff(rawModel, state) {
 //   3. re-apply the named values, so explicit pose-file values win over the switch reset
 //   4. mark coreModel as the pose's last model, so updateParameters does not run a second,
 //      hidden reset on its first call (that would make the first render differ from later ones)
-//   5. sdkPose.updateParameters(coreModel, SDK_POSE_SETTLE_SECONDS): the real SDK fade,
-//      settled completely, plus link copying
+//   5. sdkPose.updateParameters(coreModel, settle): the real SDK fade plus link copying.
+//      settle comes from the loaded pose's own fade time (CubismPose._fadeTimeSeconds, set
+//      from pose3 FadeInTime, SDK default 0.5 s when <= 0): doFade adds dt / fadeTime to
+//      the visible part's opacity, so dt = 2 x fadeTime takes any part from 0 to 1 in one
+//      call, and hidden parts then drop to 0.
 //   6. Core update
 // Motion, expression, blink, breath, physics and focus never run.
-export const SDK_POSE_SETTLE_SECONDS = 1000;
+export function sdkPoseSettleSeconds(sdkPose) {
+  const fade = sdkPose?._fadeTimeSeconds;
+  if (typeof fade !== 'number' || !Number.isFinite(fade) || fade <= 0) fail('E_SDK_POSE_FADE', 'CubismPose fade time unavailable or not a finite positive number');
+  const settle = fade * 2;
+  if (!Number.isFinite(settle)) fail('E_SDK_POSE_FADE', 'CubismPose fade time too large to settle');
+  return settle;
+}
+
+// Every part ID a pose addresses must be a real part of the moc3. CubismPose resolves
+// unknown IDs to dummy indices, so a missing part would otherwise load and "run" silently.
+export function checkPosePartIds(posePartIds, state) {
+  const known = new Set(state.parts.map(p => p.id));
+  for (const [g, group] of (posePartIds?.groups ?? []).entries()) {
+    for (const id of group) if (!known.has(id)) fail('E_POSE_PART_UNKNOWN', `pose group ${g}: part ${safeId(id)} is not a part of this moc3`);
+  }
+  for (const {from, to} of posePartIds?.links ?? []) {
+    if (!known.has(to)) fail('E_POSE_PART_UNKNOWN', `pose link from ${safeId(from)}: part ${safeId(to)} is not a part of this moc3`);
+  }
+  if (!posePartIds?.groups?.length) fail('E_POSE_PART_UNKNOWN', 'pose declares no part groups');
+}
+
+// Part IDs held by a loaded CubismPose (pinned framework: _partGroups[].partId / .link[].partId,
+// _partGroupCounts). Returns null when those fields are not present.
+export function posePartIdsFromCubismPose(sdkPose) {
+  const parts = sdkPose?._partGroups, counts = sdkPose?._partGroupCounts;
+  if (!Array.isArray(parts) || !Array.isArray(counts)) return null;
+  const groups = [], links = [];
+  let begin = 0;
+  for (const count of counts) {
+    const group = parts.slice(begin, begin + count);
+    groups.push(group.map(p => p.partId));
+    for (const p of group) for (const link of p.link ?? []) links.push({from: p.partId, to: link.partId});
+    begin += count;
+  }
+  return {groups, links};
+}
 
 export function installDeterministicUpdate(internalModel, rawModel, state, getPose, onApplied = () => {}, {sdkPose = null, onPoseStep = () => {}} = {}) {
   const coreModel = internalModel.coreModel;
   if (sdkPose && !(fn(sdkPose, 'reset') && fn(sdkPose, 'updateParameters'))) fail('E_SDK_POSE_UNAVAILABLE', 'CubismPose reset/updateParameters not available');
+  if (sdkPose) sdkPoseSettleSeconds(sdkPose); // fail at install, not on first render
   internalModel.update = function deterministicStillUpdate() {
     const pose = getPose();
     applyPose(rawModel, state, pose);
@@ -175,8 +214,9 @@ export function installDeterministicUpdate(internalModel, rawModel, state, getPo
       sdkPose.reset(coreModel);
       reapplyNamed(rawModel, state, pose);
       sdkPose._lastModel = coreModel;
-      sdkPose.updateParameters(coreModel, SDK_POSE_SETTLE_SECONDS);
-      onPoseStep({ran: true, settleSeconds: SDK_POSE_SETTLE_SECONDS});
+      const settle = sdkPoseSettleSeconds(sdkPose);
+      sdkPose.updateParameters(coreModel, settle);
+      onPoseStep({ran: true, settleSeconds: settle});
     }
     onApplied(readBack(rawModel, state, pose));
     if (fn(coreModel, 'update')) coreModel.update(); else rawModel.update();

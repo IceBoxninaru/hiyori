@@ -1,9 +1,9 @@
-// Native export pose comparison page. Raw Core mode only: every render resets all
+// Native export pose comparison page (--mode raw-core default, or sdk-pose). Every render resets all
 // parameters/part opacities to the declared defaults, applies the named pose and
 // runs Core. No motion, expression, blink, breath, physics, SDK Pose or gaze.
 // One shared WebGL renderer/stage draws each model in turn; the result is copied
 // into that slot's 2D canvas. Nothing leaves the browser; "Download PNG" saves locally.
-import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacities, partOpacityDiff, topologyNotes, deriveCamera, cropToView, poseForSlot, PreviewError} from './pose-core.mjs';
+import {readDeclaredState, validatePoseForModel, installDeterministicUpdate, partOpacities, partOpacityDiff, checkPosePartIds, posePartIdsFromCubismPose, topologyNotes, deriveCamera, cropToView, poseForSlot, PreviewError} from './pose-core.mjs';
 import {createLoadGuard} from './load-guard.mjs';
 import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, watchSdkPose, requireSdkPose} from './render-step.mjs';
 
@@ -63,6 +63,8 @@ async function loadOne(core, entry, token) {
   const moc = generationUrl(entry.moc, token), textures = entry.textures.map(t => generationUrl(t, token));
   const state = readDeclaredState(core, await fetchChecked(moc, 'binary'));
   if (!guard.isCurrent(token)) return null;
+  // Nothing is loaded yet, so a pose naming unknown parts fails here without cleanup.
+  if (config.mode === 'sdk-pose') checkPosePartIds(entry.posePartIds, state);
   // Settings with Moc + Textures (+ the model3's own Pose in sdk-pose mode) only: no physics,
   // motion or expression files are requested.
   const sdkPoseMode = config.mode === 'sdk-pose';
@@ -84,11 +86,17 @@ async function loadOne(core, entry, token) {
   try { internal.motionManager?.stopAllMotions?.(); } catch { /* ignore */ }
   let sdkPose = null;
   if (sdkPoseMode) {
-    try { sdkPose = requireSdkPose(internal, poseStatus); } catch (error) { await dispose(record); throw error; }
+    try {
+      sdkPose = requireSdkPose(internal, poseStatus);
+      // Re-check against what the SDK actually loaded (it maps unknown IDs to dummy indices).
+      const loadedIds = posePartIdsFromCubismPose(sdkPose);
+      poseStatus.loadedPartIdsChecked = !!loadedIds;
+      if (loadedIds) checkPosePartIds(loadedIds, state);
+    } catch (error) { await dispose(record); throw error; }
   }
   // Each slot applies its own branch of the current pose (v1 poses carry identical branches).
   installDeterministicUpdate(internal, raw, state, () => poseForSlot(currentPose, entry.slot), applied => { record.applied = applied; },
-    {sdkPose, onPoseStep: () => { poseStatus.ran++; }});
+    {sdkPose, onPoseStep: step => { poseStatus.ran++; poseStatus.settleSeconds = step.settleSeconds; }});
   model.visible = false;
   return record;
 }
@@ -169,7 +177,8 @@ function updateDiagnostics() {
     $(`label-${slot}`).textContent = entry.label;
     return [slot, {label: entry.label, coreVersion: state.version, mocVersion: state.mocVersion, modelCanvas: state.canvas, viewCanvasPx: shared.view,
       drawables: state.drawableIds.length, parameters: state.parameters.length, parts: state.parts.length,
-      sdkPose: poseStatus?.requested ? {loaded: poseStatus.loaded, loadError: poseStatus.error, evaluatedRenders: poseStatus.ran} : 'not used (raw-core)',
+      sdkPose: poseStatus?.requested ? {loaded: poseStatus.loaded, loadError: poseStatus.error, evaluatedRenders: poseStatus.ran,
+        settleSeconds: poseStatus.settleSeconds ?? null, partIdsCheckedAgainstMoc: true, loadedPoseIdsRechecked: poseStatus.loadedPartIdsChecked ?? false} : 'not used (raw-core)',
       requestedParameters: poseForSlot(currentPose, slot).parameters, appliedReadBack: applied,
       nonDefaultPartOpacities: partOpacityDiff(raw, state), partOpacities: partOpacities(raw, state)}];
   }));
@@ -214,6 +223,7 @@ async function downloadPng() {
 
 async function main() {
   config = await fetchChecked('/config.json', 'json');
+  $('mode-tag').textContent = `local diagnostic · ${config.mode}`;
   $('note').textContent = config.pixiUnsafeEval ? config.note
     : `${config.note} No pixi-unsafe-eval helper was configured; under this page's CSP Pixi 6 shader setup is expected to fail.`;
   crop = {...(config.camera?.crop ?? DEFAULT_CROP)};

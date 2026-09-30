@@ -337,6 +337,17 @@ pixi-live2d-display 0.4.0 `CubismPose`. Checked against public source: pixi-live
 - The page watches both events. It refuses the model with `E_SDK_POSE_UNAVAILABLE` unless `poseLoaded` fired,
   no error fired, and `internalModel.pose` has `reset` and `updateParameters`.
 - The pose is never imitated by hand-written part opacities.
+- **Part IDs:** every Group `Id` and `Link` ID must be a real part of that slot's moc3. The 0.4.0
+  `getPartIndex` maps unknown IDs to dummy indices, so a forgotten ArmB part would otherwise load and "run".
+  Failures report `E_POSE_PART_UNKNOWN`, saying whether a group entry or a link is missing. There are two
+  checks:
+  - before loading, against the IDs the server read from pose3 (nothing to clean up);
+  - after loading, against the SDK's own `_partGroups`/`_partGroupCounts`. On failure the model and its
+    textures are disposed.
+
+  Pose switch parameters are **not** required to exist in the moc3's real parameters.
+- **Mode display:** the page header and the CLI start line show the actual mode (`raw-core` or
+  `sdk-pose`).
 
 **Every render** (`installDeterministicUpdate` in `preview/pose-core.mjs`):
 1. Reset all parameters and part opacities to the declared state, then apply this slot's named values.
@@ -346,18 +357,26 @@ pixi-live2d-display 0.4.0 `CubismPose`. Checked against public source: pixi-live
 3. Re-apply the named values, so explicit pose-file values win.
 4. Set `pose._lastModel = coreModel`. Otherwise the SDK's first `updateParameters` runs a second, hidden
    `reset`, and the first render would differ from later ones.
-5. `pose.updateParameters(coreModel, 1000 s)`: the real fade, fully settled, plus link copying.
+5. `pose.updateParameters(coreModel, settle)`: the real fade plus link copying.
+   - `settle = 2 × CubismPose._fadeTimeSeconds`, the loaded pose's own fade time (pose3 `FadeInTime`; the
+     SDK uses 0.5 s when it is ≤ 0).
+   - `doFade` adds `dt / fadeTime` to the visible part's opacity, so one step takes any part, including a
+     switch to the group's second part, from 0 to 1, and hidden parts drop to 0.
+   - A missing, non-finite or overflowing fade time fails with `E_SDK_POSE_FADE`. There is no fixed step,
+     so a `FadeInTime` above 1000 s also settles.
 6. Core update.
 
 Motion, expressions, blink, breath, physics and focus stay off. The result is a still image, whatever order
 the poses were selected in.
 
-**Diagnostics:** mode, per slot `sdkPose: {loaded, loadError, evaluatedRenders}`, the full `partOpacities` and
+**Diagnostics:** mode, per slot `sdkPose: {loaded, loadError, evaluatedRenders, settleSeconds, partIdsCheckedAgainstMoc, loadedPoseIdsRechecked}`, the full `partOpacities` and
 the non-default part opacities. The PNG header states the mode and whether the pose was evaluated for each
 slot.
 
 **Limits:**
-- Setting `_lastModel` touches a field that is public in the TypeScript source but undocumented.
+- `_lastModel`, `_fadeTimeSeconds`, `_partGroups` and `_partGroupCounts` are fields that are public in the
+  pinned TypeScript source but undocumented. If the loaded pose lacks the part fields, the page still
+  relies on the pre-load check and reports `loadedPoseIdsRechecked: false`.
 - Real Pixi, CubismPose and the two-arm result are verified only in a real local browser.
 - The synthetic fake CubismPose in the tests follows the pinned source's rules for one group. It is not a
   display check of a real model.

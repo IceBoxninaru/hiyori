@@ -84,7 +84,9 @@ export function checkPose3(json, slot) {
       if ('Link' in part && !(Array.isArray(part.Link) && part.Link.every(id => typeof id === 'string'))) fail('E_POSE_FILE_SCHEMA', `${slot}: Link must be an array of part IDs`);
     }
   }
-  return json.Groups.reduce((n, g) => n + g.length, 0);
+  // Part IDs the SDK Pose will address; the page checks them against the moc3's real parts.
+  return {entries: json.Groups.reduce((n, g) => n + g.length, 0), groups: json.Groups.map(g => g.map(p => p.Id)),
+    links: json.Groups.flatMap(g => g.flatMap(p => (p.Link ?? []).map(to => ({from: p.Id, to}))))};
 }
 
 export async function preparePreview({before, after, poses, core, pixi, live2dDisplay, pixiUnsafeEval = null, camera = null, mode = 'raw-core'}) {
@@ -123,11 +125,13 @@ export async function preparePreview({before, after, poses, core, pixi, live2dDi
     if (mode === 'sdk-pose' && !refs.some(r => r.kind === 'pose')) fail('E_POSE_FILE_MISSING', `${slot}: model3 declares no FileReferences.Pose (required in sdk-pose mode)`);
     const {resolved, errors} = await resolveReferences(modelDir, refs);
     if (errors.length) fail(errors[0].code, `${slot} ${errors[0].ref}${errors[0].detail ? `: ${errors[0].detail}` : ''}`);
-    const entry = {slot, label: `${slot}: ${safeLabel(path.basename(modelReal))}`, moc: null, textures: [], pose: null, poseGroupEntries: null};
+    const entry = {slot, label: `${slot}: ${safeLabel(path.basename(modelReal))}`, moc: null, textures: [], pose: null, poseGroupEntries: null, posePartIds: null};
     for (const r of resolved) {
       if (r.kind !== 'pose') continue;
       if (path.extname(r.ref).toLowerCase() !== '.json') fail('E_REF_TYPE', `${slot} pose must be .json`);
-      entry.poseGroupEntries = checkPose3(await readJsonFile(r.file, 1 << 20, 'E_POSE_FILE_JSON', `${slot} pose`), slot);
+      const info = checkPose3(await readJsonFile(r.file, 1 << 20, 'E_POSE_FILE_JSON', `${slot} pose`), slot);
+      entry.poseGroupEntries = info.entries;
+      entry.posePartIds = {groups: info.groups, links: info.links};
     }
     resolved.forEach((r, i) => {
       const ext = path.extname(r.ref).toLowerCase();
@@ -269,7 +273,7 @@ async function main() {
   return new Promise(resolve => {
     server.once('error', e => { process.stderr.write(e?.code === 'EADDRINUSE' ? `E_PORT_BUSY: ${opts.port}\n` : 'E_LISTEN\n'); resolve(2); });
     server.listen(opts.port, '127.0.0.1', () => {
-      process.stdout.write(`Native preview (raw-core, read-only): http://127.0.0.1:${opts.port}/\n`);
+      process.stdout.write(`Native preview (${prepared.config.mode}, read-only): http://127.0.0.1:${opts.port}/\n`);
     });
   });
 }

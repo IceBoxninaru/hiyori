@@ -10,7 +10,7 @@ import http from 'node:http';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {preparePreview, createPreviewServer, resolveRequest, parseArgs, parseCamera, PREVIEW_FILES} from '../tools/serve-native-preview.mjs';
-import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, parsePosesV2, poseForSlot, sharedPosesAsModels, partOpacities, SDK_POSE_SETTLE_SECONDS} from '../preview/pose-core.mjs';
+import {readDeclaredState, validatePoseForModel, applyPose, installDeterministicUpdate, partOpacityDiff, topologyNotes, deriveCamera, cropToView, parsePosesV2, poseForSlot, sharedPosesAsModels, partOpacities, sdkPoseSettleSeconds, checkPosePartIds, posePartIdsFromCubismPose} from '../preview/pose-core.mjs';
 import {compareReports, runAudit} from '../src/export-audit.mjs';
 import {createLoadGuard} from '../preview/load-guard.mjs';
 import {renderSlotOnce, disposeRecord, loadSlotsOwned, loadOwnedModel, purgeTextureCache, generationUrl, FIXED_UPDATE_MS, watchSdkPose, requireSdkPose} from '../preview/render-step.mjs';
@@ -668,6 +668,7 @@ test('sdk-pose serves only the model3 Pose besides Moc/Textures; raw-core never 
     const prepared = await preparePreview({...fx.opts, mode: 'sdk-pose'});
     assert.equal(prepared.config.mode, 'sdk-pose');
     assert.deepEqual(prepared.config.models.map(m => [m.pose, m.poseGroupEntries]), [['/m/before/r/2.json', 2], ['/m/after/r/2.json', 2]]);
+    assert.deepEqual(prepared.config.models[0].posePartIds, {groups: [['PartArmA', 'PartArmB']], links: []});
     await withServer(prepared, async get => {
       const r = await get('/m/after/r/2.json?g=3');
       assert.equal(r.status, 200); assert.equal(JSON.parse(r.body).Groups[0][1].Id, 'PartArmB');
@@ -721,32 +722,44 @@ test('SDK Pose load failures never count as sdk-pose success', () => {
 // A fake CubismPose that follows the pinned framework's reset/updateParameters/doFade rules for
 // one group, with its switch values held OUTSIDE the raw Core arrays (framework-side), as for
 // part IDs that are not real parameters.
-function fakeCubismPose(log, fadeSeconds = 0.5) {
+function fakeCubismPose(log, fadeSeconds = 0.5, rig = null) {
+  // Switch values: a real parameter with the part's ID when the moc3 has one (read/written in
+  // the raw Core arrays), otherwise a framework-side value - as in the pinned CubismPose.
+  const sw = {PartArmA: 0, PartArmB: 0};
+  const getSwitch = (model, id) => rig?.hasParam(id) ? rig.param(id) : sw[id];
+  const setSwitch = (model, id, v) => { if (rig?.hasParam(id)) rig.setParam(id, v); else sw[id] = v; };
   return {
-    _lastModel: undefined, switches: {PartArmA: 0, PartArmB: 0}, parts: ['PartArmA', 'PartArmB'],
-    reset(model) { log.push('reset'); this.parts.forEach((id, j) => { model.setPartOpacity(id, j === 0 ? 1 : 0); this.switches[id] = j === 0 ? 1 : 0; }); },
+    _lastModel: undefined, _fadeTimeSeconds: fadeSeconds, parts: ['PartArmA', 'PartArmB'],
+    _partGroups: [{partId: 'PartArmA', link: []}, {partId: 'PartArmB', link: []}], _partGroupCounts: [2],
+    reset(model) { log.push('reset'); this.parts.forEach((id, j) => { model.setPartOpacity(id, j === 0 ? 1 : 0); setSwitch(model, id, j === 0 ? 1 : 0); }); },
     updateParameters(model, dt) {
       log.push(`update:${this._lastModel === model ? 'same' : 'hidden-reset'}:${dt}`);
       if (model !== this._lastModel) this.reset(model);
       this._lastModel = model;
-      let visible = this.parts.findIndex(id => this.switches[id] > 0.001), next = 1;
-      if (visible >= 0) next = Math.min(1, model.getPartOpacity(this.parts[visible]) + dt / fadeSeconds); else visible = 0;
+      let visible = this.parts.findIndex(id => getSwitch(model, id) > 0.001), next = 1;
+      if (visible >= 0) next = Math.min(1, model.getPartOpacity(this.parts[visible]) + dt / this._fadeTimeSeconds); else visible = 0;
       this.parts.forEach((id, i) => {
         if (i === visible) model.setPartOpacity(id, next);
-        else { const a1 = next < 0.5 ? next * (0.5 - 1) / 0.5 + 1 : (1 - next) * 0.5 / 0.5; model.setPartOpacity(id, Math.min(model.getPartOpacity(id), a1)); }
+        else {
+          let a1 = next < 0.5 ? next * (0.5 - 1) / 0.5 + 1 : (1 - next) * 0.5 / 0.5;
+          if ((1 - a1) * (1 - next) > 0.15) a1 = 1 - 0.15 / (1 - next);
+          model.setPartOpacity(id, Math.min(model.getPartOpacity(id), a1));
+        }
       });
     },
   };
 }
-function sdkPoseRig(log) {
-  const f = fakeCore(PROBE_SPEC());
+function sdkPoseRig(log, spec = PROBE_SPEC()) {
+  const f = fakeCore(spec);
   const state = readDeclaredState(f.core, MOC), raw = f.newModel();
   const idx = id => state.parts.findIndex(p => p.id === id);
   const coreModel = {
     setPartOpacity(id, v) { raw.parts.opacities[idx(id)] = v; }, getPartOpacity(id) { return raw.parts.opacities[idx(id)]; },
     update() { log.push(`core:${Array.from(raw.parts.opacities).join(',')}:${Array.from(raw.parameters.values).join(',')}`); raw.update(); },
   };
-  return {state, raw, coreModel};
+  const pidx = id => state.parameters.findIndex(q => q.id === id);
+  const rig = {hasParam: id => pidx(id) >= 0, param: id => raw.parameters.values[pidx(id)], setParam: (id, v) => { raw.parameters.values[pidx(id)] = v; }};
+  return {state, raw, coreModel, rig};
 }
 
 test('sdk-pose order: declared reset + named values, CubismPose.reset, named re-applied, no hidden reset, settled update, Core update', () => {
@@ -760,7 +773,7 @@ test('sdk-pose order: declared reset + named values, CubismPose.reset, named re-
   installDeterministicUpdate(internal, raw, state, () => ({name: 'raise', parameters: {ParamArmRaiseR: 1}}), a => { applied = a; }, {sdkPose, onPoseStep: () => { steps++; }});
   raw.parts.opacities[1] = 0.7; raw.parameters.values[1] = 1; // stale state from a previous pose
   internal.update();
-  assert.deepEqual(log, ['named-before-reset:1', 'reset', `update:same:${SDK_POSE_SETTLE_SECONDS}`, 'core:1,0:0,0,0.5,1']);
+  assert.deepEqual(log, ['named-before-reset:1', 'reset', 'update:same:1', 'core:1,0:0,0,0.5,1'], 'settle = 2 x the pose fade time (0.5 s)');
   assert.deepEqual(applied, {ParamArmRaiseR: 1}, 'explicit value re-applied after the pose switch reset');
   assert.equal(steps, 1);
   assert.deepEqual(partOpacities(raw, state), {PartArmA: 1, PartArmB: 0}, 'one arm set visible after the settled SDK fade');
@@ -793,4 +806,74 @@ test('raw-core compatibility: no pose object is touched and the update order is 
   raw.parts.opacities[1] = 0.7;
   internal.update();
   assert.deepEqual(log, ['core:1,0.25:0,0,0.5,1'], 'raw Core: declared part opacities kept, no SDK Pose step');
+});
+
+// ---- review of 06743ea -----------------------------------------------------------------------------
+test('pose group part IDs must exist in the moc3 (config and loaded-pose checks)', () => {
+  const state = readDeclaredState(fakeCore(SPEC()).core, MOC); // parts: PartArmA, PartArmB
+  assert.doesNotThrow(() => checkPosePartIds({groups: [['PartArmA', 'PartArmB']], links: []}, state));
+  assert.throws(() => checkPosePartIds({groups: [['PartArmA', 'PartArmBx']], links: []}, state),
+    e => e.code === 'E_POSE_PART_UNKNOWN' && e.detail === 'pose group 0: part PartArmBx is not a part of this moc3');
+  assert.throws(() => checkPosePartIds({groups: [], links: []}, state), e => e.code === 'E_POSE_PART_UNKNOWN');
+  // what the SDK actually loaded: an ArmB group entry that the export forgot
+  const loaded = posePartIdsFromCubismPose({_partGroups: [{partId: 'PartArmA', link: []}, {partId: 'PartArmMissing', link: []}], _partGroupCounts: [2]});
+  assert.deepEqual(loaded, {groups: [['PartArmA', 'PartArmMissing']], links: []});
+  assert.throws(() => checkPosePartIds(loaded, state), e => e.code === 'E_POSE_PART_UNKNOWN' && /PartArmMissing/.test(e.detail));
+  assert.equal(posePartIdsFromCubismPose({}), null);
+});
+
+test('pose Link part IDs must exist in the moc3', () => {
+  const state = readDeclaredState(fakeCore(SPEC()).core, MOC);
+  assert.throws(() => checkPosePartIds({groups: [['PartArmA', 'PartArmB']], links: [{from: 'PartArmB', to: 'PartArmBLeft'}]}, state),
+    e => e.code === 'E_POSE_PART_UNKNOWN' && e.detail === 'pose link from PartArmB: part PartArmBLeft is not a part of this moc3');
+  const loaded = posePartIdsFromCubismPose({_partGroups: [{partId: 'PartArmA', link: [{partId: 'PartArmA'}]}, {partId: 'PartArmB', link: [{partId: 'NoSuchPart'}]}], _partGroupCounts: [2]});
+  assert.throws(() => checkPosePartIds(loaded, state), e => e.code === 'E_POSE_PART_UNKNOWN' && /NoSuchPart/.test(e.detail));
+});
+
+test('settle follows the real pose fade time: FadeInTime above 1000 s with a switch to the second part fully settles', () => {
+  const spec = PROBE_SPEC();
+  spec.params.push({id: 'PartArmA', min: 0, max: 1, default: 0}, {id: 'PartArmB', min: 0, max: 1, default: 0}); // real switch parameters
+  const log = [];
+  const {state, raw, coreModel, rig} = sdkPoseRig(log, spec);
+  const sdkPose = fakeCubismPose(log, 5000, rig);
+  let current = {name: 'arm-b', parameters: {PartArmA: 0, PartArmB: 1}};
+  const internal = {coreModel};
+  installDeterministicUpdate(internal, raw, state, () => current, () => {}, {sdkPose});
+  internal.update();
+  assert.deepEqual(partOpacities(raw, state), {PartArmA: 0, PartArmB: 1}, 'second part fully visible, first fully hidden');
+  assert.ok(log.includes('update:same:10000'));
+  // the previous fixed 1000 s step would NOT settle this fade (shows the test is meaningful)
+  const log2 = [], rig2 = sdkPoseRig(log2, spec), pose2 = fakeCubismPose(log2, 5000, rig2.rig);
+  pose2.reset(rig2.coreModel); rig2.rig.setParam('PartArmA', 0); rig2.rig.setParam('PartArmB', 1); pose2._lastModel = rig2.coreModel;
+  pose2.updateParameters(rig2.coreModel, 1000);
+  assert.ok(partOpacities(rig2.raw, rig2.state).PartArmB < 1, 'fixed 1000 s leaves the fade unfinished');
+  // back to the first part and again: still a still image
+  current = {name: 'arm-a', parameters: {PartArmA: 1, PartArmB: 0}}; internal.update();
+  assert.deepEqual(partOpacities(raw, state), {PartArmA: 1, PartArmB: 0});
+  for (const bad of [undefined, 0, -1, NaN, Infinity, Number.MAX_VALUE]) {
+    assert.throws(() => sdkPoseSettleSeconds({_fadeTimeSeconds: bad}), e => e.code === 'E_SDK_POSE_FADE', String(bad));
+  }
+  assert.throws(() => installDeterministicUpdate({coreModel}, raw, state, () => current, () => {}, {sdkPose: {...sdkPose, _fadeTimeSeconds: undefined}}), e => e.code === 'E_SDK_POSE_FADE');
+});
+
+test('actual mode is shown: page tag set from config, CLI start line names the mode', async () => {
+  const html = await readFile(path.join(HERE, '..', 'preview', 'index.html'), 'utf8');
+  assert.ok(!/raw Core mode/i.test(html), 'no hard-coded mode text in the page');
+  assert.match(await readFile(path.join(HERE, '..', 'preview', 'app.mjs'), 'utf8'), /\$\('mode-tag'\)\.textContent = `local diagnostic · \$\{config\.mode\}`/);
+  const fx = await poseFixture();
+  const probe = http.createServer(); await new Promise(r => probe.listen(0, '127.0.0.1', r)); const port = probe.address().port; await new Promise(r => probe.close(r));
+  const {spawn} = await import('node:child_process');
+  const cli = path.join(HERE, '..', 'tools', 'serve-native-preview.mjs');
+  const child = spawn(process.execPath, [cli, '--before', fx.opts.before, '--after', fx.opts.after, '--poses', fx.opts.poses, '--port', String(port),
+    '--core', fx.opts.core, '--pixi', fx.opts.pixi, '--live2d-display', fx.opts.live2dDisplay, '--mode', 'sdk-pose']);
+  try {
+    let timer;
+    const line = await new Promise((resolve, reject) => {
+      child.stdout.once('data', d => resolve(String(d)));
+      child.once('exit', code => reject(new Error(`exited ${code}`)));
+      timer = setTimeout(() => reject(new Error('timeout')), 10000);
+    }).finally(() => clearTimeout(timer));
+    assert.match(line, /^Native preview \(sdk-pose, read-only\): http:\/\/127\.0\.0\.1:/);
+    assert.ok(!line.includes(fx.dir));
+  } finally { child.kill(); await fx.cleanup(); }
 });
